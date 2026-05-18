@@ -1,432 +1,183 @@
-# OCP 与社区 Cluster Autoscaler 能力调研及 ACP 方案建议
+# ACP Cluster Autoscaler 方案设计
 
-本文用于梳理 OpenShift Container Platform（OCP）Cluster Autoscaler、社区 Kubernetes Cluster Autoscaler、Cluster API（CAPI）autoscaling 之间的关系，并给出 ACP 的产品化方案建议。
+本文基于 `cluster-autoscaler-ocp-community-research.md` 的调研结论，设计 ACP 的 Cluster Autoscaler 产品化方案。
 
-ACP 的前提假设是：ACP 对接的基础设施 provider 都基于 CAPI 实现，因此节点生命周期管理抽象更接近 CAPI 的 `MachineDeployment` / `MachineSet` / `MachinePool` / `Machine`，而不是 OCP 的 Machine API。
+ACP 的前提假设是：ACP 对接的基础设施 provider 都基于 Cluster API（CAPI）实现，节点生命周期管理抽象更接近 CAPI `MachineDeployment` / `Machine` / `InfraMachine`，而不是 OpenShift Machine API。
 
-需要提前说明的是，社区 Cluster Autoscaler 的 `clusterapi` cloud provider 可以围绕 CAPI `MachineDeployment`、`MachineSet`、`MachinePool` 做扩缩容；但 ACP 初版设计只基于 `MachineDeployment` 完成产品化封装。也就是说，`MachineAutoscaler` 只引用 `MachineDeployment`，`autoscaler-manager` 也只向 `MachineDeployment` 注入 autoscaler 相关 annotations。`MachineSet` 和 `MachinePool` 仅作为背景能力讨论，不纳入本文推荐的 ACP 初版实现范围。
+本文中的 `ClusterAutoscaler`、`MachineAutoscaler`、`NodeGroupProfile` 和 `autoscaler-manager` 是 ACP 产品层设计建议，最终 API group、字段名和 controller 行为以 ACP API 评审结果为准。
 
-## 0. 版本与适用范围
-
-本文基于 OCP 4.21 文档、社区 Cluster Autoscaler `cluster-autoscaler-release-1.35` 分支以及 CAPI `cluster.x-k8s.io` API 体系进行分析。不同 OCP 版本、Cluster Autoscaler 版本和 CAPI provider 对 flags、expander、scale-from-zero 模板、`MachinePool` 支持和 annotations 的暴露范围可能不同；与本文分析不一致时，应以 ACP 实际选定版本和本地代码实现为准。
-
-本文讨论的是节点自动扩缩容架构选型，不覆盖 HPA / VPA / KEDA 等 workload 级弹性能力。
-
-## 1. 结论摘要
+## 1. 方案摘要
 
 ACP 推荐采用：
 
 ```text
-社区 Kubernetes Cluster Autoscaler
+ACP 产品层 CRD
+  -> autoscaler-manager
+  -> 社区 Kubernetes Cluster Autoscaler
   -> --cloud-provider=clusterapi
-  -> ACP 初版只管理 CAPI MachineDeployment
+  -> CAPI MachineDeployment
   -> CAPI Machine / InfraMachine
   -> VM / Instance / Bare Metal Host
   -> Kubernetes Node
 ```
 
-产品层可以提供 OCP 风格的 CRD 体验，但底层不建议引入 OCP Machine API，也不建议开发 ACP 自己的 Cluster Autoscaler cloud provider。
+核心设计：
 
-推荐的 ACP 产品化链路是：
+- 底层复用社区 Cluster Autoscaler 和内置 `clusterapi` cloud provider。
+- ACP 初版只把 CAPI `MachineDeployment` 作为 autoscaler node group，不暴露 `MachineSet` / `MachinePool`。
+- ACP 提供 OCP 风格的产品体验：
+  - `ClusterAutoscaler`：集群级 autoscaler 实例和全局策略。
+  - `MachineAutoscaler`：单个 `MachineDeployment` 的 min/max。
+  - `NodeGroupProfile`：从 0 扩容所需的新节点调度画像，可选增强能力。
+- 新增 `autoscaler-manager`，负责把 ACP CR 翻译为社区 Cluster Autoscaler Deployment、ConfigMap、RBAC、flags 和 CAPI annotations。
+- 实时扩缩容决策仍由社区 Cluster Autoscaler 完成，ACP controller 不参与每次 Pending Pod 的调度模拟。
+
+一句话结论：**ACP 对齐 OCP 的产品体验和职责拆分，但底层复用社区 Cluster Autoscaler + CAPI provider，不复刻 OCP Machine API，也不开发新的 Cluster Autoscaler cloud provider。**
+
+## 2. 目标与非目标
+
+### 2.1 目标
+
+1. 为 ACP 的 CAPI 集群提供节点自动扩缩容能力。
+2. 使用社区 Cluster Autoscaler 的成熟调度模拟、expander 和缩容能力。
+3. 提供面向用户的 CRD 产品接口，避免用户直接维护 Cluster Autoscaler flags、ConfigMap 和 CAPI annotations。
+4. 初版稳定支持 CAPI `MachineDeployment` autoscaling。
+5. 普通扩缩容作为基础能力，从 0 扩容作为 provider 可选增强能力。
+6. 在 ACP status 中暴露 autoscaler 实例部署、annotation 同步、模板缺失、模板漂移、缩容阻塞等状态。
+
+### 2.2 非目标
+
+1. 不引入 OpenShift Machine API。
+2. 不开发 ACP 自己的 Cluster Autoscaler cloud provider。
+3. 初版不把 CAPI `MachineSet` / `MachinePool` 暴露为产品层 node group。
+4. 不让 `autoscaler-manager` 实时执行扩缩容决策。
+5. 不要求所有 provider 都支持 `minReplicas: 0`。
+6. 不覆盖 HPA、VPA、KEDA 等 workload 级弹性能力。
+
+## 3. 总体架构
+
+ACP autoscaling 方案由三层组成：
+
+| 层次 | 组件 | 职责 |
+|---|---|---|
+| 产品层 | ACP `ClusterAutoscaler` / `MachineAutoscaler` / `NodeGroupProfile` | 提供用户可理解、可审计、可校验的 autoscaling API。 |
+| 翻译层 | `autoscaler-manager` | 把 ACP CR 翻译为社区 CA 实例、ConfigMap、RBAC、flags 和 CAPI annotations。 |
+| 执行层 | 社区 Cluster Autoscaler + CAPI controller + provider controller | 发现 Pending Pod / 低利用率 Node，调整 `MachineDeployment.replicas`，创建或删除真实机器。 |
+
+整体链路图：
+
+```mermaid
+flowchart LR
+    UI["ACP UI / API"]
+
+    subgraph Product["ACP 产品层 CRD"]
+      ClusterAutoscaler["ClusterAutoscaler"]
+      MachineAutoscaler["MachineAutoscaler"]
+      NodeGroupProfile["NodeGroupProfile（可选）"]
+    end
+
+    Manager["autoscaler-manager"]
+
+    subgraph Generated["下发配置"]
+      CADeployment["社区 Cluster Autoscaler<br/>Deployment / ConfigMap / flags / RBAC"]
+      MachineDeploymentAnnotations["CAPI MachineDeployment<br/>autoscaler annotations"]
+    end
+
+    ClusterAPIProvider["社区 Cluster Autoscaler<br/>clusterapi cloud provider"]
+    CAPIController["CAPI controller"]
+    InfraController["provider-specific<br/>InfraMachine controller"]
+    Infrastructure["VM / Instance / Bare Metal Host"]
+    Node["Kubernetes Node"]
+
+    UI --> ClusterAutoscaler
+    UI --> MachineAutoscaler
+    UI --> NodeGroupProfile
+    ClusterAutoscaler --> Manager
+    MachineAutoscaler --> Manager
+    NodeGroupProfile --> Manager
+    Manager --> CADeployment
+    Manager --> MachineDeploymentAnnotations
+    CADeployment --> ClusterAPIProvider
+    MachineDeploymentAnnotations --> ClusterAPIProvider
+    ClusterAPIProvider --> CAPIController
+    CAPIController --> InfraController
+    InfraController --> Infrastructure
+    Infrastructure --> Node
+```
+
+### 3.1 部署模型
+
+建议把社区 Cluster Autoscaler 部署在 global 管理集群中，但实例粒度按 workload cluster 拆分。
+
+```mermaid
+flowchart TB
+    subgraph Global["global 管理集群"]
+      Manager["autoscaler-manager"]
+      ACPCR["ClusterAutoscaler / MachineAutoscaler / NodeGroupProfile"]
+      CAPI["CAPI Cluster / MachineDeployment / Machine"]
+      CA1["社区 Cluster Autoscaler<br/>for workload-cluster-a"]
+      CA2["社区 Cluster Autoscaler<br/>for workload-cluster-b"]
+    end
+
+    subgraph A["workload cluster a"]
+      APods["Pods / PDBs"]
+      ANodes["Nodes"]
+    end
+
+    subgraph B["workload cluster b"]
+      BPods["Pods / PDBs"]
+      BNodes["Nodes"]
+    end
+
+    ACPCR -->|watch / reconcile| Manager
+    Manager -->|创建 / 更新 CA 实例| CA1
+    Manager -->|创建 / 更新 CA 实例| CA2
+    Manager -->|写入 min/max 与 capacity annotations| CAPI
+
+    CA1 -->|读取 Pods / Nodes / PDBs| A
+    CA2 -->|读取 Pods / Nodes / PDBs| B
+    CA1 -->|调整 MachineDeployment replicas| CAPI
+    CA2 -->|调整 MachineDeployment replicas| CAPI
+    CAPI -->|创建 / 删除 Machine| ANodes
+    CAPI -->|创建 / 删除 Machine| BNodes
+```
+
+这样设计的原因：
+
+- Cluster Autoscaler 的决策边界天然是单个 workload cluster。
+- ACP 的 CAPI 对象和 provider controller 位于 global 管理集群，CA 部署在 global 更靠近 CAPI 控制面。
+- 每套 CA 通过 workload kubeconfig 访问目标业务集群，通过 management kubeconfig 或 in-cluster 权限访问 global 中的 CAPI 对象。
+- 不需要把 global 管理集群的高权限凭据下发到业务集群。
+- `autoscaler-manager` 可以统一管理 per-cluster CA 实例的创建、升级、参数和删除。
+
+### 3.2 组件职责边界
+
+| 组件 | 负责什么 | 不负责什么 |
+|---|---|---|
+| ACP `ClusterAutoscaler` | 声明是否为某业务集群部署 CA，以及集群级策略 | 不直接做扩缩容决策 |
+| ACP `MachineAutoscaler` | 声明某个 `MachineDeployment` 的 min/max | 不保存机器模板，不创建机器 |
+| ACP `NodeGroupProfile` | 描述从 0 扩容时新节点的调度画像 | 不管理副本数，不创建机器 |
+| `autoscaler-manager` | reconcile CA 实例和 CAPI annotations | 不模拟调度，不实时决定扩缩容 |
+| 社区 Cluster Autoscaler | 发现 Pending Pod / 低利用率 Node，做扩缩容决策 | 不管理 ACP 产品层 CR |
+| CAPI / provider controller | 创建 / 删除真实机器并维护 Machine / Node 状态 | 不做 autoscaler 决策 |
+
+两个 controller 的关系：
 
 ```text
-ACP ClusterAutoscaler CR
-  -> 声明目标业务集群、是否启用 autoscaler、集群级 autoscaler 配置
-  -> autoscaler-manager
-  -> 在 global 集群创建 / 更新对应的社区 Cluster Autoscaler Deployment
-
-ACP MachineAutoscaler CR
-  -> 单个 CAPI MachineDeployment 的 min/max
-  -> autoscaler-manager
-  -> CAPI MachineDeployment autoscaler annotations
-
-ACP NodeGroupProfile CR（可选，从 0 扩容需要）
-  -> provider 同步的新节点调度画像
-  -> autoscaler-manager
-  -> CAPI scale-from-zero annotations
+autoscaler-manager
+  -> watch ClusterAutoscaler，部署 / 更新每个业务集群对应的社区 CA 实例
+  -> watch MachineAutoscaler、NodeGroupProfile，把配置写到 MachineDeployment annotations
+  -> 不做实时扩缩容决策
 
 社区 Cluster Autoscaler
-  -> 实时做扩容、缩容、调度模拟和 expander 决策
+  -> 实时发现 Pending Pod
+  -> 做调度模拟、expander 选择和 scale-down 判断
+  -> 修改 CAPI MachineDeployment replicas
 ```
 
-核心判断：
+### 3.3 基础能力与增强能力
 
-- 社区 Cluster Autoscaler 已经内置 `clusterapi` cloud provider，ACP 基础方案不需要改造社区 autoscaler。
-- ACP 需要新增的是产品层 controller，例如 `autoscaler-manager`，负责根据 `ClusterAutoscaler` 部署社区 Cluster Autoscaler 实例，并根据 `MachineAutoscaler`、`NodeGroupProfile` 等资源把扩缩容配置翻译成 CAPI `MachineDeployment` annotations。
-- 实时扩缩容决策仍由社区 Cluster Autoscaler 完成，ACP controller 不参与每次 Pending Pod 的调度模拟。
-- ACP 初版的 node group 统一指 CAPI `MachineDeployment`；`MachineSet` 和 `MachinePool` 只用于解释 OCP / 社区能力差异，不作为 ACP 初版 API 目标。
-- `NodeGroupProfile` 是 ACP 为产品化从 0 扩容提出的可选抽象，不是 Kubernetes、CAPI 或社区 Cluster Autoscaler 的现有 API。
-- 从 0 扩容需要准确的新节点调度属性，ACP 可以在方案层引入 provider 可维护的节点组调度画像。
-
-一句话概括：**ACP 对齐 OCP 的产品体验和职责拆分，但底层复用社区 Cluster Autoscaler + CAPI provider，而不是复刻 OCP Machine API。**
-
-## 2. Cluster Autoscaler 的通用机制
-
-Cluster Autoscaler 解决的是“节点数量是否需要变化”的问题。
-
-它不直接根据节点 CPU 使用率扩容，也不替代 HPA / VPA / KEDA。它主要看两类信号：
-
-```text
-扩容：是否存在因资源或调度约束无法调度的 Pending Pod
-缩容：是否存在长期低利用率且可以安全清空的 Node
-```
-
-### 2.1 扩容、缩容和 expander 决策
-
-典型扩容过程：
-
-```text
-发现 Pending Pod
-  -> 模拟不同 node group 扩一个节点后能否承载 Pod
-  -> 选择合适的 node group
-  -> 调用 provider / machine API 增加节点
-  -> 新节点加入集群
-  -> Pending Pod 被调度
-```
-
-扩容判断会考虑：
-
-- CPU / memory request。
-- GPU / extended resources。
-- `nodeSelector`。
-- node affinity / anti-affinity。
-- taint / toleration。
-- topology spread。
-- volume topology。
-- Pod affinity / anti-affinity。
-
-如果 Pod Pending 的原因是错误的调度约束，而不是新增节点可以解决的容量不足，Cluster Autoscaler 不一定会扩容。
-
-典型缩容过程：
-
-```text
-发现低利用率 Node
-  -> 判断低利用率是否持续足够长时间
-  -> 判断 Node 上的 Pod 是否可以被驱逐
-  -> 模拟这些 Pod 是否能在其他 Node 重新调度
-  -> cordon / drain Node
-  -> 删除底层 Machine / VM / 实例
-  -> Node 从集群中移除
-```
-
-缩容比扩容更容易被阻塞，常见原因包括：
-
-- PodDisruptionBudget 过于严格。
-- Pod 使用本地存储。
-- Pod 不是由 Deployment、ReplicaSet、StatefulSet、DaemonSet、Job 等控制器管理。
-- Pod 标记了 `cluster-autoscaler.kubernetes.io/safe-to-evict: "false"`。
-- 节点上存在系统关键 Pod。
-- Pod 搬迁后无法满足 affinity、anti-affinity、topology spread 等约束。
-- 其他节点没有足够资源承载被驱逐 Pod。
-- node group 已达到最小副本数。
-
-当多个 node group 都能承载 Pending Pod 时，Cluster Autoscaler 需要选择扩容哪个 node group。常见 expander 策略包括：
-
-- `random` / `Random`：在可行 node group 中随机选择。
-- `least-waste` / `LeastWaste`：先过滤出能让 Pending Pod 调度成功的 node group，再比较新增节点后的 CPU / memory 剩余比例，选择资源浪费更少的方案。
-- `priority` / `Priority`：按配置的 node group 优先级选择。
-- `most-pods`：优先选择能承载最多 Pending Pod 的 node group。
-- `least-nodes`：倾向于用更少新增节点完成调度。
-- `price`：基于成本选择，适合 provider 能提供价格信息的场景。
-- `grpc`：通过外部 gRPC expander 决策。
-
-`least-waste` 优化的是装箱效率，不等同于最低成本。GPU、label、taint、zone 等通常先决定“这个 node group 能不能成为候选”，CPU / memory waste 再决定候选里谁更省。
-
-`priority` 规则通常是静态配置，但候选资格会随 Pending Pod、调度约束、max size、provider backoff 等实时变化。平台常见组合是：
-
-```text
-priority,least-waste
-```
-
-即先表达业务或成本偏好，再在同优先级候选中选择资源浪费更少的方案。
-
-### 2.2 node group 抽象与管理范围
-
-Cluster Autoscaler 不直接管理“所有 Node”，而是管理它能识别的 node group。Node 是否属于 autoscaler 管理范围，取决于它能否映射到一个已发现、可扩缩容的 node group。
-
-不同平台的 node group 抽象不同：
-
-```text
-云厂商 ASG 模型：
-Cluster Autoscaler -> 云厂商 ASG / node pool -> VM -> Node
-
-OCP 模型：
-ClusterAutoscaler -> MachineAutoscaler -> MachineSet -> Machine -> Node
-
-CAPI 模型：
-Cluster Autoscaler -> MachineDeployment / MachineSet / MachinePool -> Machine -> InfraMachine -> Node
-```
-
-从社区能力看，`clusterapi` cloud provider 可以围绕 CAPI `MachineDeployment`、`MachineSet`、`MachinePool` 建模；从 ACP 初版产品设计看，本文后续只把 CAPI `MachineDeployment` 作为普通 worker node group，不把 `MachineSet` 或 `MachinePool` 纳入 ACP 初版实现范围。
-
-在社区 Cluster Autoscaler + CAPI provider 场景里，可以理解为：
-
-```text
-Node
-  -> 能通过 providerID 映射到某个 CAPI Machine
-  -> Machine 属于 ACP 管理的 MachineDeployment
-  -> 该 MachineDeployment 被 clusterapi provider 发现
-  -> 该 MachineDeployment 配置了 autoscaler min/max
-  -> 该 Node 属于 autoscaler 管理范围
-```
-
-通常需要满足以下条件：
-
-1. node group 在 `--node-group-auto-discovery=clusterapi:...` 的发现范围内。
-2. node group 有 autoscaler min/max annotations。
-3. Node 与 Machine 的 `providerID` 关系正确。
-4. provider 能把 Node 归属映射回对应 node group。
-
-例如：
-
-```yaml
-apiVersion: cluster.x-k8s.io/v1beta1
-kind: MachineDeployment
-metadata:
-  name: worker-md-0
-  annotations:
-    cluster.x-k8s.io/cluster-api-autoscaler-node-group-min-size: "1"
-    cluster.x-k8s.io/cluster-api-autoscaler-node-group-max-size: "10"
-spec:
-  replicas: 3
-```
-
-如果另一个 `MachineDeployment` 没有 min/max annotations，即使它也是 CAPI 管理的节点组，也通常不会被 Cluster Autoscaler 当成可扩缩容 node group。
-
-### 2.3 从 0 扩容为什么特殊
-
-从 0 扩容的关键问题是：node group 当前没有 Node，Cluster Autoscaler 无法从现有 Node 推断新节点能力。
-
-普通扩缩容通常依赖“已有 Node 作为模板”；从 0 扩容没有现成 Node，所以必须从 MachineTemplate、provider status、provider-specific 模板或产品层标准化对象中得到一个“虚拟新节点”的 CPU、memory、labels、taints、GPU、topology 等调度信息，否则调度模拟没有依据。
-
-如果这些信息不准确，就可能出现 autoscaler 以为新节点能承载 Pending Pod，但真实节点加入后 Pod 仍然无法调度的情况。
-
-不同 Cluster Autoscaler provider 获取这些信息的方式不同：有的能从云厂商 instance type 或机器模板推断，有的需要额外 annotations，有的需要平台侧提供标准化信息。ACP 具体如何产品化这件事放到第 6 章说明。
-
-## 3. OCP 如何产品化 Cluster Autoscaler
-
-OCP Cluster Autoscaler 是 OpenShift 面向 Machine API 体系的产品化集成。它不直接管理云厂商 ASG，而是通过 OpenShift Machine API 管理节点生命周期。
-
-典型链路：
-
-```text
-ClusterAutoscaler
-  -> MachineAutoscaler
-  -> MachineSet
-  -> Machine
-  -> Node
-```
-
-### 3.1 OCP 的两个核心 CR
-
-OCP 中常说的 MachineSet autoscaler 对应 CR 实际名称是 `MachineAutoscaler`。它不是节点模板对象，而是面向某个 `MachineSet` 的伸缩边界配置。
-
-| CR | 作用范围 | 主要职责 |
-|---|---|---|
-| `ClusterAutoscaler` | 集群级 | 配置集群资源上限、缩容参数、部分扩容选择策略等全局行为。 |
-| `MachineAutoscaler` | 单个 `MachineSet` | 指定某个 `MachineSet` 是否允许自动扩缩容，以及 min / max 副本数。 |
-| `MachineSet` | 单个节点组 | 保存新机器模板，包括 providerSpec、failure domain、labels、taints、bootstrap 引用等。 |
-
-`ClusterAutoscaler` 示例：
-
-```yaml
-apiVersion: autoscaling.openshift.io/v1
-kind: ClusterAutoscaler
-metadata:
-  name: default
-spec:
-  resourceLimits:
-    maxNodesTotal: 20
-    cores:
-      min: 8
-      max: 200
-    memory:
-      min: 32
-      max: 1024
-  scaleDown:
-    enabled: true
-    unneededTime: 10m
-    utilizationThreshold: "0.5"
-```
-
-`MachineAutoscaler` 示例：
-
-```yaml
-apiVersion: autoscaling.openshift.io/v1beta1
-kind: MachineAutoscaler
-metadata:
-  name: worker-us-east-1a
-  namespace: openshift-machine-api
-spec:
-  minReplicas: 1
-  maxReplicas: 5
-  scaleTargetRef:
-    apiVersion: machine.openshift.io/v1beta1
-    kind: MachineSet
-    name: worker-us-east-1a
-```
-
-如果只创建 `ClusterAutoscaler`，但没有为目标 `MachineSet` 创建 `MachineAutoscaler`，该 `MachineSet` 通常不会被自动扩缩容。
-
-### 3.2 OCP 如何保持模板与 Node 一致
-
-OCP 的一致性来自同一个 `MachineSet` 同时服务于两件事：
-
-```text
-Cluster Autoscaler 调度模拟
-  -> 读取 MachineSet / 现有 Node 信息
-
-Machine API 创建真实机器
-  -> 使用同一个 MachineSet.spec.template
-```
-
-如果 `MachineSet` 当前已有 Node，autoscaler 可以从真实 Node 推断 CPU、memory、labels、taints、topology、GPU 等调度信息。如果副本数为 0，则需要 OCP 对对应平台的 `MachineSet.providerSpec` 和 node template 有内置支持。
-
-因此，`MachineAutoscaler` 本身不需要理解 AWS、Azure、vSphere 或 bare metal 模板字段；不同 provider 的模板语义由 OCP Machine API provider / autoscaler 集成处理。
-
-### 3.3 OCP 从 0 扩容的平台支持
-
-按 OCP 4.21 文档，`MachineAutoscaler.spec.minReplicas` 可以在以下平台上设为 `0`：
-
-- AWS。
-- Google Cloud / GCP。
-- Azure。
-- RHOSP / OpenStack。
-- VMware vSphere。
-
-这表示 OCP 对这些平台的 Machine API provider 和 Cluster Autoscaler 集成已经具备必要的 node template 推断能力。副本数为 0 时，autoscaler 没有现成 Node 可参考，需要从 `MachineSet.spec.template`、provider-specific `providerSpec`、failure domain、实例规格或平台元数据中推断新节点的 CPU、memory、labels、taints、topology、GPU 等调度信息。
-
-未列入支持范围的平台，不应默认支持 `minReplicas: 0`。例如 bare metal 场景依赖可用物理机库存和 `BareMetalHost` 状态，OCP 文档没有将其列入 `minReplicas: 0` 支持平台；即使能自动扩容，也通常需要至少保留可作为模板参考的节点或依赖平台明确支持。
-
-另外，OCP 文档提醒不要把 IPI 安装过程中创建的三个默认 compute `MachineSet` 的 `minReplicas` 设为 `0`。更合理的用法是：默认 worker 池保留基础容量，把 `minReplicas: 0` 用在 GPU、大规格、昂贵或低频使用的专用 `MachineSet` 上。
-
-## 4. 社区 Cluster Autoscaler 与 CAPI provider
-
-社区 Cluster Autoscaler 是通用 Kubernetes 节点自动扩缩容组件。它通过 cloud provider / node group provider 接口对接不同基础设施。
-
-常见 provider 包括 AWS、Azure、GCE / GKE、Cluster API、OpenStack Magnum、DigitalOcean、Hetzner、Linode、Oracle Cloud、Scaleway、TencentCloud、Vultr、Rancher 和 external gRPC provider。
-
-### 4.1 社区版的配置入口
-
-社区版通常通过 Deployment 参数、flags、provider 配置和 ConfigMap 管理。
-
-常见参数包括：
-
-```text
---cloud-provider
---nodes
---node-group-auto-discovery
---expander
---scale-down-enabled
---scale-down-unneeded-time
---scale-down-utilization-threshold
---skip-nodes-with-local-storage
---skip-nodes-with-system-pods
-```
-
-在 CAPI 场景中，核心参数是：
-
-```text
---cloud-provider=clusterapi
---node-group-auto-discovery=clusterapi:namespace=<capi-cluster-namespace>,clusterName=<workload-cluster>
-```
-
-`clusterapi` 是社区 Cluster Autoscaler 内置 cloud provider 名称。它负责读取 CAPI `MachineDeployment`、`MachineSet`、`MachinePool` 等对象，并在扩缩容时调整这些对象的副本数。不同版本支持的对象类型以实际选定的 Cluster Autoscaler / CAPI provider 实现为准；ACP 初版只暴露 `MachineDeployment`。
-
-### 4.2 CAPI 场景下的 min/max 与 scale-from-zero 表达
-
-社区 `clusterapi` provider 通常通过 CAPI `MachineDeployment`、`MachineSet`、`MachinePool` 上的 annotations 表达 node group min/max；ACP 初版只要求在目标 `MachineDeployment` 上写入这些 annotations：
-
-```yaml
-metadata:
-  annotations:
-    cluster.x-k8s.io/cluster-api-autoscaler-node-group-min-size: "1"
-    cluster.x-k8s.io/cluster-api-autoscaler-node-group-max-size: "10"
-```
-
-从 0 扩容需要额外的 template node 信息。在 Cluster Autoscaler `cluster-autoscaler-release-1.35` 中，`clusterapi` provider 可以从两类来源构造 scale-from-zero 所需的 template node：目标 CAPI `MachineDeployment` 上的 capacity annotations，以及 infrastructure template 的 `status.capacity` / `status.nodeSystemInfo` 等状态字段。
-
-常用 annotations：
-
-| annotation | 必需性 | 作用 |
-|---|---|---|
-| `cluster.x-k8s.io/cluster-api-autoscaler-node-group-min-size` | 必需 | node group 最小规模；从 0 扩容时通常设为 `"0"`。 |
-| `cluster.x-k8s.io/cluster-api-autoscaler-node-group-max-size` | 必需 | node group 最大规模。 |
-| `capacity.cluster-autoscaler.kubernetes.io/cpu` | 条件必需 | 新节点 CPU capacity；provider 不能提供 capacity 时必须设置。 |
-| `capacity.cluster-autoscaler.kubernetes.io/memory` | 条件必需 | 新节点 memory capacity；provider 不能提供 capacity 时必须设置。 |
-| `capacity.cluster-autoscaler.kubernetes.io/ephemeral-disk` | 可选 | 新节点临时磁盘 capacity。 |
-| `capacity.cluster-autoscaler.kubernetes.io/maxPods` | 可选 | 新节点最大 Pod 数；未设置时通常按 `110` 处理。 |
-| `capacity.cluster-autoscaler.kubernetes.io/labels` | 可选 | 预定义节点 labels，用于模拟 `nodeSelector` / node affinity。 |
-| `capacity.cluster-autoscaler.kubernetes.io/taints` | 可选 | 预定义节点 taints，用于模拟 tolerations。 |
-| `capacity.cluster-autoscaler.kubernetes.io/csi-driver` | 可选 | 预定义 CSI driver 及 volume limit，例如 `ebs.csi.aws.com=25`。 |
-| `capacity.cluster-autoscaler.kubernetes.io/gpu-type` | GPU 可选 | 传统 device plugin 场景的 GPU extended resource 名称，例如 `nvidia.com/gpu`。 |
-| `capacity.cluster-autoscaler.kubernetes.io/dra-driver` | GPU 可选 | Kubernetes DRA 场景的 driver 名称；通常与 `gpu-type` 二选一。 |
-| `capacity.cluster-autoscaler.kubernetes.io/gpu-count` | GPU 可选 | GPU 数量。 |
-
-示例：
-
-```yaml
-metadata:
-  annotations:
-    cluster.x-k8s.io/cluster-api-autoscaler-node-group-min-size: "0"
-    cluster.x-k8s.io/cluster-api-autoscaler-node-group-max-size: "5"
-    capacity.cluster-autoscaler.kubernetes.io/cpu: "16"
-    capacity.cluster-autoscaler.kubernetes.io/memory: "128G"
-    capacity.cluster-autoscaler.kubernetes.io/ephemeral-disk: "100Gi"
-    capacity.cluster-autoscaler.kubernetes.io/maxPods: "200"
-    capacity.cluster-autoscaler.kubernetes.io/labels: "node-type=gpu,workload=batch,topology.kubernetes.io/zone=zone-a"
-    capacity.cluster-autoscaler.kubernetes.io/taints: "workload=batch:NoSchedule"
-    capacity.cluster-autoscaler.kubernetes.io/gpu-type: "nvidia.com/gpu"
-    capacity.cluster-autoscaler.kubernetes.io/gpu-count: "2"
-```
-
-需要注意：
-
-- capacity annotations 会覆盖 provider template 中由 provider 提供的 capacity 信息。
-- labels 会把目标 CAPI `MachineDeployment` 中可传播到 Node 的 labels 与 capacity annotation labels 合并；按当前分支实现，同名 key 冲突时 annotation 优先。
-- taints 的合并行为依赖目标 CAPI / Cluster Autoscaler 版本以及 `MachineTaintPropagation` 等能力，落地前需要确认。
-- `maxPods` 未设置时通常按 `110` 处理。
-- DRA 场景使用 `dra-driver`；传统 device plugin 场景使用 `gpu-type`，不要让两者同时代表同一个 GPU 资源。
-
-capacity annotations 属于需要在目标 Cluster Autoscaler / CAPI provider 版本中确认的能力；如果 ACP 选定版本不支持，则需要升级或 backport 后才能作为从 0 扩容实现基础。
-
-## 5. OCP 与社区 Cluster Autoscaler 的差异
-
-| 对比项 | OCP Cluster Autoscaler | 社区 Cluster Autoscaler |
-|---|---|---|
-| 定位 | OpenShift 集成版节点自动扩缩容 | 通用 Kubernetes 节点自动扩缩容组件 |
-| 节点组抽象 | OpenShift `MachineSet` | cloud provider node group、CAPI `MachineDeployment` / `MachineSet` / `MachinePool`、external provider 等 |
-| 扩缩容接口 | OpenShift Machine API | cloud provider API、CAPI API、external gRPC provider 等 |
-| 单个节点组 min/max | `MachineAutoscaler.spec.minReplicas` / `maxReplicas` | provider 配置、`--nodes`、auto discovery、CAPI annotations 等 |
-| 集群级配置 | `ClusterAutoscaler` CR | Deployment flags / provider config / ConfigMap |
-| 运维方式 | Operator / CRD 管理 | 用户或平台维护 Deployment、RBAC、参数、凭据 |
-| 产品绑定 | 绑定 OpenShift / OCP | 不绑定发行版 |
-| provider 覆盖 | 以 OCP Machine API 支持范围为准 | 覆盖多云、CAPI、external provider 等 |
-| 参数可调性 | 取决于 OCP API 暴露 | 可直接调整更多 flags |
-| 从 0 扩容 | 依赖 MachineSet 模板和 OCP 平台支持 | 依赖 provider 能提供新节点调度属性；CAPI 场景可能依赖模板和 capacity annotations |
-| 适合 ACP | 不推荐作为底层方案，除非 ACP 本身就是 OCP Machine API 平台 | 推荐，尤其是 `clusterapi` cloud provider |
-
-OCP 值得 ACP 借鉴的是产品化 CRD 体验和职责拆分，不是 OpenShift Machine API 本身。
-
-## 6. ACP 推荐设计
-
-ACP 的关键背景是：基础设施 provider 已经基于 CAPI 实现。ACP 需要的是一个能复用 CAPI 抽象、减少 provider 重复适配、同时具备成熟调度模拟和缩容能力的节点 autoscaler 方案。
-
-本文中的 OCP 和社区 Cluster Autoscaler 行为是现有能力描述；ACP `ClusterAutoscaler`、`MachineAutoscaler`、`NodeGroupProfile` 和 `autoscaler-manager` 是本文提出的产品层设计建议，最终 API group、字段名和 controller 行为以 ACP API 设计评审结果为准。
-
-本章按以下顺序展开 ACP 设计：
-
-1. 总体架构、职责拆分与部署形态。
-2. `ClusterAutoscaler`：集群级配置，对齐 OCP 的 `ClusterAutoscaler`。
-3. `MachineAutoscaler`：节点组级 min/max，对齐 OCP 的 `MachineAutoscaler`。
-4. `NodeGroupProfile`：ACP 为从 0 扩容新增的可选调度画像。
-5. `autoscaler-manager`：负责翻译 ACP CR 到社区 Cluster Autoscaler Deployment 和 CAPI annotations。
-
-ACP 的设计目标不是复刻 OCP Machine API，而是在 CAPI 基础上提供接近 OCP 的产品化体验：用户通过 `ClusterAutoscaler` 配置集群级策略，通过 `MachineAutoscaler` 配置单个节点组的 min/max；底层由 `autoscaler-manager` 翻译为社区 Cluster Autoscaler 实例和 CAPI `MachineDeployment` annotations。
-
-下文把从 0 扩容所需的标准化“节点组调度画像”暂命名为 `NodeGroupProfile`。这个名字强调它描述的是 node group 的调度能力，而不是 Kubernetes Node 模板或 CAPI `MachineTemplate`。`NodeGroupProfile` 是本文建议的 ACP 产品层抽象，不是 Kubernetes、CAPI 或社区 Cluster Autoscaler 的现有 API。
-
-ACP 的能力建议分成两层：
+ACP autoscaling 能力建议分成两层：
 
 ```text
 基础能力：普通扩缩容
@@ -437,159 +188,42 @@ ACP 的能力建议分成两层：
 可选增强：从 0 扩容
   -> 适用于 minReplicas: 0 的 node group
   -> 额外依赖 provider 上报 ready 的 NodeGroupProfile
-  -> 由 autoscaler-manager 生成 scale-from-zero annotations
+  -> autoscaler-manager 生成 scale-from-zero annotations
 ```
 
-### 6.1 总体架构、职责拆分与部署形态
+## 4. CRD 设计总览
 
-ACP autoscaling 方案由三类对象和组件组成：ACP 新增的产品层 CRD / controller、复用的社区 Cluster Autoscaler、以及已有的 CAPI / provider 控制面。
+ACP 建议新增三个产品层 CRD：
 
-| 名称 | 来源 | 是否需要新开发 | 用途 |
+| CRD | 粒度 | 必需性 | 作用 |
 |---|---|---|---|
-| `ClusterAutoscaler` CR | ACP 产品层 | 是 | 声明是否为某个业务集群启用 autoscaler，以及该 autoscaler 实例的集群级参数，例如资源上限、缩容参数、expander。 |
-| `MachineAutoscaler` CR | ACP 产品层 | 是 | 声明某个 CAPI `MachineDeployment` 是否允许自动扩缩容，以及该 node group 的 `minReplicas` / `maxReplicas`。 |
-| `NodeGroupProfile` CR | ACP 产品层，可选 | 是 | 描述某个 node group 从 0 扩容时新节点应具备的调度属性，例如 CPU、memory、labels、taints、GPU；只在从 0 扩容场景需要。 |
-| `autoscaler-manager` | ACP controller | 是 | 一方面 watch `ClusterAutoscaler` CR，为目标业务集群自动部署一套社区 Cluster Autoscaler，包括 Deployment、RBAC、ConfigMap、Secret mount、container args 等；另一方面 watch `MachineAutoscaler`、`NodeGroupProfile` 等资源，把 node group 扩缩容配置翻译成 annotations 写到目标 CAPI `MachineDeployment`。 |
-| 社区 Cluster Autoscaler | 社区组件 | 否，直接复用 | 读取业务集群 Pending Pod、Node、PDB 等信息，执行调度模拟、expander 选择、缩容判断，并通过 `clusterapi` cloud provider 调整 node group replicas。 |
-| `clusterapi` cloud provider | 社区 Cluster Autoscaler 内置 provider | 否，直接复用 | 让社区 Cluster Autoscaler 通过 CAPI 对象管理节点组，ACP 初版只暴露 `MachineDeployment`。 |
-| CAPI `MachineDeployment` / `Machine` | CAPI 对象 | 否，复用现有 CAPI | 表达节点组和单个机器；`MachineDeployment` 是 ACP 初版唯一的 autoscaler node group 目标。 |
-| provider-specific controller / `InfraMachine` | ACP provider / CAPI provider | 否，复用已有 provider 能力 | 根据 CAPI `Machine` 创建或删除真实 VM、实例或裸金属资源，并维护 Machine / Node 状态。 |
+| `ClusterAutoscaler` | 每个 workload cluster 一份 | 必需 | 声明目标业务集群、是否启用 autoscaler、集群级资源限制、缩容策略、expander 策略和 CA 部署配置。 |
+| `MachineAutoscaler` | 每个可扩缩容 `MachineDeployment` 一份 | 必需 | 声明单个 node group 的 `minReplicas` / `maxReplicas`，并引用目标 CAPI `MachineDeployment`。 |
+| `NodeGroupProfile` | 每个支持从 0 扩容的 node group 一份 | 可选 | 描述新节点的调度画像，例如 CPU、memory、labels、taints、GPU；由 provider controller 同步。 |
 
-简化职责如下：
+推荐命名和引用规则：
 
-| 组件 | 负责什么 | 不负责什么 |
-|---|---|---|
-| ACP `ClusterAutoscaler` | 声明是否为某业务集群部署 CA，以及集群级参数 | 不直接做扩缩容决策 |
-| ACP `MachineAutoscaler` | 声明某个 `MachineDeployment` 的 min/max | 不保存机器模板 |
-| ACP `NodeGroupProfile` | 描述从 0 扩容时新节点的调度画像 | 不创建机器 |
-| `autoscaler-manager` | 把 ACP CR 翻译成 CA Deployment 和 CAPI annotations | 不模拟调度，不实时决定扩缩容 |
-| 社区 Cluster Autoscaler | 发现 Pending Pod / 低利用率 Node，做扩缩容决策 | 不管理 ACP 产品层 CR |
-| CAPI / provider controller | 创建 / 删除真实机器并维护 Machine / Node 状态 | 不做 autoscaler 决策 |
+- 三类 ACP CR 建议位于 global 管理集群的 `cpaas-system` namespace。
+- `ClusterAutoscaler` 与 workload cluster 一对一。
+- `MachineAutoscaler` 与目标 CAPI `MachineDeployment` 一对一。
+- `MachineAutoscaler.spec.clusterRef` 指向目标 CAPI `Cluster`，用于定位 CAPI namespace。
+- `MachineAutoscaler.spec.scaleTargetRef` 只引用同一 CAPI namespace 下的 `MachineDeployment`，初版不支持跨 namespace node group 引用。
+- `NodeGroupProfile` 与引用它的 `MachineAutoscaler` 位于同一 namespace，建议名称与目标 `MachineDeployment` 一致。
 
-整体链路是：
+## 5. ClusterAutoscaler CRD
 
-```text
-ACP UI / API
-  -> ACP ClusterAutoscaler CR
-  -> ACP MachineAutoscaler CR
-  -> 可选：ACP NodeGroupProfile CR
-  -> autoscaler-manager
-  -> 社区 Cluster Autoscaler Deployment / ConfigMap / flags
-  -> CAPI MachineDeployment autoscaler annotations
-  -> 社区 Cluster Autoscaler clusterapi cloud provider
-  -> CAPI controller
-  -> provider-specific InfraMachine controller
-  -> 底层 VM / Instance / Bare Metal Host
-  -> Kubernetes Node
-```
+`ClusterAutoscaler` 声明“为哪个业务集群部署 autoscaler 实例”以及该实例的集群级参数。
 
-在 ACP 场景下，建议把社区 Cluster Autoscaler 部署在 global 管理集群中，但实例粒度仍然按业务集群拆分。`autoscaler-manager` 负责管理这些 per-workload-cluster autoscaler 实例；每套社区 Cluster Autoscaler 通过 workload kubeconfig 访问对应业务集群，通过 management kubeconfig 或 in-cluster 权限访问 global 中的 CAPI 对象。
+OCP 的 `ClusterAutoscaler` 位于被管理集群内，天然只代表当前集群；ACP 的 `ClusterAutoscaler` 位于 global 管理集群内，因此需要通过 `clusterRef` 指明目标业务集群。
 
-```mermaid
-flowchart TB
-    subgraph Global[global 管理集群]
-      Manager[autoscaler-manager]
-      CAPI[CAPI Cluster / MachineDeployment / Machine]
-      CA1["社区 Cluster Autoscaler<br/>for provider-cluster-a"]
-      CA2["社区 Cluster Autoscaler<br/>for provider-cluster-b"]
-    end
-
-    subgraph A[provider-cluster-a 业务集群]
-      APods[Pods / PDBs]
-      ANodes[Nodes]
-    end
-
-    subgraph B[provider-cluster-b 业务集群]
-      BPods[Pods / PDBs]
-      BNodes[Nodes]
-    end
-
-    Manager -->|watch ClusterAutoscaler| CA1
-    Manager -->|watch ClusterAutoscaler| CA2
-    Manager -->|"watch MachineAutoscaler / NodeGroupProfile<br/>写入 min/max 与 capacity annotations"| CAPI
-
-    CA1 -->|--kubeconfig| A
-    CA2 -->|--kubeconfig| B
-    CA1 -->|"--cloud-config / in-cluster RBAC<br/>调整 MachineDeployment replicas"| CAPI
-    CA2 -->|"--cloud-config / in-cluster RBAC<br/>调整 MachineDeployment replicas"| CAPI
-    CAPI -->|创建 / 删除 Machine| ANodes
-    CAPI -->|创建 / 删除 Machine| BNodes
-```
-
-这样设计的原因是：
-
-- Cluster Autoscaler 的决策边界天然是单个 workload cluster，因为它要读取该集群的 Pending Pod、Node、PDB、调度约束并执行 drain / eviction。
-- ACP 的 CAPI controller 和 CAPI 对象只在 global 集群，因此 autoscaler 部署在 global 更靠近 CAPI 控制面。
-- 每套 autoscaler 通过 workload kubeconfig 访问对应业务集群，通过 management kubeconfig / in-cluster 权限访问 global 中的 CAPI 对象。
-- 不需要把 global 管理集群的高权限凭据下发到业务集群。
-- `autoscaler-manager` 可以统一管理这些 per-cluster autoscaler 实例的创建、升级、参数和删除。
-- ACP 初版只为已验证支持 autoscaling 语义的 CAPI provider 集群创建 autoscaler；baremetal 集群由于节点库存、capacity、删除语义和 providerID 映射仍需单独验证，初版暂不创建实例，也不生成可 autoscale 的 `MachineAutoscaler`。这是 ACP 初版产品范围限制，不代表 CAPI / Cluster Autoscaler 在技术上永久不能对接裸金属；后续如果 baremetal provider 能稳定提供节点库存、capacity、删除语义和 Machine / Node `providerID` 映射，可以再按 provider 能力扩展。
-
-这里有两个不同层面的 controller：
-
-```text
-autoscaler-manager
-  -> watch ClusterAutoscaler，部署 / 更新每个业务集群对应的社区 Cluster Autoscaler 实例
-  -> watch MachineAutoscaler、NodeGroupProfile，把 node group 扩缩容配置写到 MachineDeployment annotations
-  -> 不做实时扩缩容决策
-
-社区 Cluster Autoscaler
-  -> 实时发现 Pending Pod
-  -> 做调度模拟、expander 选择和 scale-down 判断
-  -> 修改 CAPI node group replicas
-```
-
-整体交互可以用下面的时序图理解：
-
-```mermaid
-sequenceDiagram
-    actor User as ACP 用户 / 平台 API
-    participant AACC as autoscaler-manager
-    participant Provider as ACP provider controller
-    participant CAPI as CAPI MachineDeployment
-    participant CA as 社区 Cluster Autoscaler
-    participant K8s as Workload Cluster
-    participant Infra as InfraMachine / 底层资源
-
-    User->>AACC: 创建 / 更新 ClusterAutoscaler
-    AACC->>CA: reconcile Deployment / flags / ConfigMap
-
-    User->>AACC: 创建 / 更新 MachineAutoscaler(min/max)
-    AACC->>CAPI: 写入 node group min/max annotations
-
-    alt 普通扩缩容
-        CA->>K8s: 发现 Pending Pod 或低利用率 Node
-        CA->>CAPI: 读取 MachineDeployment 与现有 Node 信息
-        CA->>CAPI: 调整 replicas
-        CAPI->>Infra: 创建或删除 Machine / InfraMachine
-        Infra->>K8s: Node 加入或移除集群
-    else 可选：从 0 扩容
-        Provider->>AACC: 上报 / 同步 ready NodeGroupProfile
-        AACC->>CAPI: 写入 capacity annotations
-        CA->>K8s: 发现 Pending Pod
-        CA->>CAPI: 读取 min/max 与 capacity annotations
-        CA->>CAPI: 将 replicas 从 0 调整为 1 或更多
-        CAPI->>Infra: 创建 Machine / InfraMachine
-        Infra->>K8s: 新 Node 加入集群
-    end
-```
-
-### 6.2 ACP ClusterAutoscaler：对齐 OCP 的集群级配置
-
-ACP `ClusterAutoscaler` 声明“为哪个业务集群部署 autoscaler 实例”以及该实例的集群级参数。OCP 的 `ClusterAutoscaler` 位于被管理集群内，天然只代表当前集群；ACP 的 `ClusterAutoscaler` 位于 global 管理集群内，因此需要通过 `clusterRef` 指明目标业务集群。
-
-它在 ACP 中同时表达两类语义：
-
-- 部署语义：通过 `clusterRef`、`enabled` 和 kubeconfig 引用声明为哪个业务集群部署 autoscaler 实例。
-- 配置语义：通过 `resourceLimits`、`scaleDown`、`expander` 等字段声明该 autoscaler 实例的集群级参数。
-
-示例：
+### 5.1 示例
 
 ```yaml
 apiVersion: autoscaling.acp.example.io/v1alpha1
 kind: ClusterAutoscaler
 metadata:
   name: provider-cluster-a
+  namespace: cpaas-system
 spec:
   enabled: true
   clusterRef:
@@ -603,6 +237,9 @@ spec:
   managementKubeconfigRef:
     name: global-kubeconfig
     namespace: cpaas-system
+  nodeGroupDiscovery:
+    namespace: provider-cluster-a
+    clusterName: provider-cluster-a
   resourceLimits:
     maxNodesTotal: 100
     cores:
@@ -615,100 +252,137 @@ spec:
     enabled: true
     unneededTime: 10m
     utilizationThreshold: "0.5"
-  expander: priority,least-waste
+    skipNodesWithLocalStorage: true
+    skipNodesWithSystemPods: true
+  expander:
+    strategies:
+      - priority
+      - least-waste
+    priorityConfig:
+      priorities:
+        - priority: 100
+          nodeGroups:
+            - ".*gpu.*"
+        - priority: 50
+          nodeGroups:
+            - ".*worker.*"
+  deployment:
+    image: registry.example.io/autoscaler/cluster-autoscaler:v1.35.0
+    replicas: 1
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+    logLevel: 4
 ```
 
-`autoscaler-manager` watch 到 `ClusterAutoscaler` 后，负责在 global 集群中创建或更新对应的社区 Cluster Autoscaler Deployment、ServiceAccount、RBAC、ConfigMap 和 kubeconfig Secret mount，并把执行结果写回 `ClusterAutoscaler.status`。
+### 5.2 spec 字段定义
 
-这些字段最终会被 `autoscaler-manager` 翻译到社区 Cluster Autoscaler 的配置入口，但这些入口不一定都是 Kubernetes Deployment spec 字段。下面这张表的重点不是要求 ACP CRD 字段与社区 CA flag 一一同名，而是说明：ACP CRD 是产品层 API，`autoscaler-manager` 需要把它翻译成社区 CA 能识别的 Deployment 参数、ConfigMap、Secret mount 或 RBAC。
+| 字段 | 类型 | 必需 | 含义 |
+|---|---|---|---|
+| `spec.enabled` | `bool` | 是 | 是否为目标 workload cluster 启用 autoscaler。`false` 表示 `autoscaler-manager` 应删除或暂停对应 CA 实例，并清晰写入 status。 |
+| `spec.clusterRef` | `ObjectReference` | 是 | 指向目标业务集群对应的 CAPI `Cluster`。`autoscaler-manager` 使用它确定 workload cluster 身份和 CAPI namespace。 |
+| `spec.clusterRef.apiVersion` | `string` | 是 | 目标 CAPI `Cluster` 的 API 版本，例如 `cluster.x-k8s.io/v1beta1`。 |
+| `spec.clusterRef.kind` | `string` | 是 | 目标对象类型，初版固定为 `Cluster`。 |
+| `spec.clusterRef.namespace` | `string` | 是 | 目标 CAPI `Cluster` 所在 namespace，也是初版查找 `MachineDeployment` 的 namespace。 |
+| `spec.clusterRef.name` | `string` | 是 | 目标 CAPI `Cluster` 名称。 |
+| `spec.workloadKubeconfigRef` | `SecretReference` | 是 | 指向访问 workload cluster 的 kubeconfig Secret。社区 CA 使用它读取 Pods、Nodes、PDBs，并执行 drain / eviction。 |
+| `spec.workloadKubeconfigRef.name` | `string` | 是 | workload kubeconfig Secret 名称。 |
+| `spec.workloadKubeconfigRef.namespace` | `string` | 否 | workload kubeconfig Secret namespace；未设置时默认与 `ClusterAutoscaler` 同 namespace。 |
+| `spec.managementKubeconfigRef` | `SecretReference` | 否 | 指向访问 global 管理集群的 kubeconfig Secret。若 CA 使用 in-cluster RBAC 访问 CAPI 对象，可不填。 |
+| `spec.managementKubeconfigRef.name` | `string` | 条件必需 | management kubeconfig Secret 名称；当不使用 in-cluster 权限时必填。 |
+| `spec.managementKubeconfigRef.namespace` | `string` | 否 | management kubeconfig Secret namespace；未设置时默认与 `ClusterAutoscaler` 同 namespace。 |
+| `spec.nodeGroupDiscovery` | `NodeGroupDiscovery` | 是 | CAPI node group 自动发现配置，会被翻译为 `--node-group-auto-discovery=clusterapi:...`。 |
+| `spec.nodeGroupDiscovery.namespace` | `string` | 是 | CAPI node group 所在 namespace。初版建议与 `clusterRef.namespace` 相同。 |
+| `spec.nodeGroupDiscovery.clusterName` | `string` | 是 | CAPI cluster 名称，用于限制 CA 只发现该 workload cluster 的 node group。 |
+| `spec.resourceLimits` | `ResourceLimits` | 否 | 集群级资源边界，作用于整个 workload cluster，不只统计 `MachineAutoscaler` 管理的节点组。 |
+| `spec.resourceLimits.maxNodesTotal` | `int32` | 否 | 目标 workload cluster 的总节点数上限，翻译为 `--max-nodes-total`。主要限制后续扩容。 |
+| `spec.resourceLimits.cores` | `ResourceRange` | 否 | 目标 workload cluster 的 CPU 总量上下限，翻译为 `--cores-total=<min>:<max>`。 |
+| `spec.resourceLimits.cores.min` | `int64` | 否 | 缩容后不应低于的 CPU core 总量。 |
+| `spec.resourceLimits.cores.max` | `int64` | 否 | 扩容后不应超过的 CPU core 总量。 |
+| `spec.resourceLimits.memory` | `ResourceRange` | 否 | 目标 workload cluster 的 memory 总量上下限，翻译为 `--memory-total=<min>:<max>`。单位建议固定为 GiB 整数。 |
+| `spec.resourceLimits.memory.min` | `int64` | 否 | 缩容后不应低于的 memory GiB 总量。 |
+| `spec.resourceLimits.memory.max` | `int64` | 否 | 扩容后不应超过的 memory GiB 总量。 |
+| `spec.scaleDown` | `ScaleDownConfig` | 否 | 缩容策略配置。未设置时使用 ACP 默认值或社区 CA 默认值。 |
+| `spec.scaleDown.enabled` | `bool` | 否 | 是否启用缩容，翻译为 `--scale-down-enabled`。 |
+| `spec.scaleDown.unneededTime` | `Duration` | 否 | 节点持续低利用率多久后可被视为缩容候选，翻译为 `--scale-down-unneeded-time`。 |
+| `spec.scaleDown.utilizationThreshold` | `string` | 否 | 节点利用率低于该阈值时可成为缩容候选，翻译为 `--scale-down-utilization-threshold`。建议使用字符串避免浮点精度歧义。 |
+| `spec.scaleDown.skipNodesWithLocalStorage` | `bool` | 否 | 是否跳过包含本地存储 Pod 的节点，翻译为 `--skip-nodes-with-local-storage`。 |
+| `spec.scaleDown.skipNodesWithSystemPods` | `bool` | 否 | 是否跳过包含系统 Pod 的节点，翻译为 `--skip-nodes-with-system-pods`。 |
+| `spec.expander` | `ExpanderConfig` | 否 | 扩容候选 node group 的选择策略。 |
+| `spec.expander.strategies` | `[]string` | 否 | expander 链，例如 `priority,least-waste`，翻译为 `--expander=priority,least-waste`。 |
+| `spec.expander.priorityConfig` | `PriorityExpanderConfig` | 条件必需 | 当 strategies 包含 `priority` 时使用，由 `autoscaler-manager` 同步为 workload cluster 中固定名称的 priority ConfigMap。 |
+| `spec.expander.priorityConfig.priorities` | `[]PriorityRule` | 否 | priority expander 规则列表，数字越大优先级越高。 |
+| `spec.expander.priorityConfig.priorities[].priority` | `int32` | 是 | 一组 node group 正则的优先级。 |
+| `spec.expander.priorityConfig.priorities[].nodeGroups` | `[]string` | 是 | 匹配 node group 名称的正则表达式列表。 |
+| `spec.deployment` | `DeploymentConfig` | 否 | 社区 CA 实例的部署参数。 |
+| `spec.deployment.image` | `string` | 否 | 社区 CA 镜像。未设置时使用 ACP 默认镜像。 |
+| `spec.deployment.replicas` | `int32` | 否 | CA Deployment 副本数。通常为 `1`，因为 CA 通过 leader election 或单实例运行控制决策。 |
+| `spec.deployment.resources` | `ResourceRequirements` | 否 | CA Pod 的 requests / limits。 |
+| `spec.deployment.resources.requests` | `map[string]string` | 否 | CA Pod 资源请求，例如 CPU、memory。 |
+| `spec.deployment.resources.limits` | `map[string]string` | 否 | CA Pod 资源限制。 |
+| `spec.deployment.logLevel` | `int32` | 否 | CA 日志等级，翻译为 `--v=<level>`。 |
+| `spec.extraArgs` | `map[string]string` | 否 | 高级扩展参数，用于透传少量社区 CA flags。建议受 allowlist 限制，避免破坏 ACP 产品语义。 |
 
-| ACP `ClusterAutoscaler` 字段 | 可能翻译到哪里 | 示例 |
+### 5.3 status 字段定义
+
+| 字段 | 类型 | 含义 |
 |---|---|---|
-| `maxNodesTotal` | container args | `--max-nodes-total=100` |
-| `resourceLimits.cores` | container args | `--cores-total=8:200` |
-| `resourceLimits.memory` | container args | `--memory-total=32:1024` |
-| `scaleDown.enabled` | container args | `--scale-down-enabled=true` |
-| `scaleDown.unneededTime` | container args | `--scale-down-unneeded-time=10m` |
-| `scaleDown.utilizationThreshold` | container args | `--scale-down-utilization-threshold=0.5` |
-| `expander` | container args | `--expander=priority,least-waste` |
-| `priorityExpanderConfig` | ConfigMap | `cluster-autoscaler-priority-expander` |
-| `nodeGroupDiscovery` | container args | `--node-group-auto-discovery=clusterapi:...` |
-| `managementKubeconfigRef` | Secret + volume mount + args | `--cloud-config=/etc/.../management-kubeconfig` |
-| `workloadKubeconfigRef` | Secret + volume mount + args | `--kubeconfig=/etc/.../workload-kubeconfig` |
-| `image` | Deployment pod template | `spec.template.spec.containers[].image` |
-| `resources` | Deployment pod template | `resources.requests/limits` |
-| `logLevel` | container args | `--v=4` |
+| `status.observedGeneration` | `int64` | controller 最近处理过的 `metadata.generation`。 |
+| `status.conditions` | `[]Condition` | 标准 Kubernetes conditions，用于表达 Ready、Deployed、ConfigSynced、WorkloadReachable、ManagementReachable 等状态。 |
+| `status.conditions[].type` | `string` | condition 类型，例如 `Ready`、`DeploymentReady`、`PriorityConfigSynced`。 |
+| `status.conditions[].status` | `True/False/Unknown` | condition 状态。 |
+| `status.conditions[].reason` | `string` | 机器可读原因，例如 `DeploymentAvailable`、`KubeconfigInvalid`、`PriorityConfigInvalid`。 |
+| `status.conditions[].message` | `string` | 面向人的状态说明。 |
+| `status.conditions[].lastTransitionTime` | `Time` | condition 最近一次状态变化时间。 |
+| `status.deploymentRef` | `ObjectReference` | `autoscaler-manager` 创建的社区 CA Deployment 引用。 |
+| `status.priorityConfigMapRef` | `ObjectReference` | 当启用 priority expander 时，workload cluster 中固定名称 priority ConfigMap 的引用信息。 |
+| `status.lastAppliedArgs` | `[]string` | 最近一次下发给社区 CA 的关键 container args，便于排障。 |
+| `status.managedNodeGroups` | `int32` | 当前通过 `MachineAutoscaler` 管理的 node group 数量。 |
+| `status.message` | `string` | 聚合后的简短状态说明。 |
 
-因此更准确的关系是：
+### 5.4 翻译规则
 
-```text
-ACP ClusterAutoscaler CR
-  -> autoscaler-manager
-  -> reconcile 一组底层资源
-     - Deployment
-     - ConfigMap
-     - Secret mount
-     - ServiceAccount / RBAC
-     - container args
-```
+`autoscaler-manager` 将 `ClusterAutoscaler` 翻译为一组底层资源：
 
-当 `expander` 包含 `priority` 时，社区 priority expander 固定读取名为 `cluster-autoscaler-priority-expander` 的 ConfigMap。该 ConfigMap 位于 Cluster Autoscaler 通过 `--kubeconfig` 访问的 workload cluster 中，namespace 由 `--namespace` 指定；只有当 Cluster Autoscaler 运行在 workload cluster 内并使用 in-cluster config 时，这个 namespace 才等同于 autoscaler Pod 所在 namespace。ConfigMap 名称在 upstream 实现中是固定常量，不是通过启动参数为每个 autoscaler 实例单独指定。
-
-这不会影响 ACP “多套 Cluster Autoscaler 都部署在 global 集群 `cpaas-system` namespace”这一部署模型。只要每套 Cluster Autoscaler 的 `--kubeconfig` 指向不同 workload cluster，即使 ConfigMap 名称相同，它们读取的也是各自 workload cluster 中的 ConfigMap，不会因为 global 中 Pod 位于同一 namespace 而冲突。
-
-ACP 在 `ClusterAutoscaler.spec.priorityExpanderConfig` 中提供产品层配置，由 `autoscaler-manager` 使用 workload kubeconfig，在目标 workload cluster 的 `--namespace` 指定 namespace 下创建 / 更新固定名称的 ConfigMap `cluster-autoscaler-priority-expander`。这样用户仍然通过 ACP `ClusterAutoscaler` 配置 priority 规则，不需要直接维护底层 ConfigMap。
-
-如果该 ConfigMap 缺失或格式错误，社区 Cluster Autoscaler 会跳过 priority expander，并继续使用 expander 链中的后续策略，例如 `priority,least-waste` 中的 `least-waste`。因此，`autoscaler-manager` 应在 `ClusterAutoscaler.status` 中暴露 priority ConfigMap 同步失败、格式校验失败或 workload 集群写入失败等状态。
-
-上面的示例展示了 `autoscaler-manager` 如何将这些配置翻译为社区 Cluster Autoscaler 的 Deployment 参数、ConfigMap、Secret mount、RBAC 等。如果目标业务集群的节点数马上超过 `maxNodesTotal`，限制扩容的不是 `autoscaler-manager`，而是社区 Cluster Autoscaler 在实时扩容判断中检查 `--max-nodes-total` 后拒绝继续扩容。
-
-`maxNodesTotal` 更准确地说是：Cluster Autoscaler 在目标 workload cluster 维度上的总节点数上限，不是 ACP 平台 quota，也不是只统计 `MachineAutoscaler` 管理的节点组。如果 ACP 未来需要限制“只有 autoscaler 管理的节点池”的总规模，那应该是平台级 quota / admission / capacity policy，而不是直接复用 Cluster Autoscaler 的 `maxNodesTotal` 语义。
-
-`cores.min/max` 和 `memory.min/max` 也是目标 workload cluster 维度上的资源总量边界，不是只统计 `MachineAutoscaler` 管理的节点组。
-
-例如：
-
-```yaml
-spec:
-  resourceLimits:
-    cores:
-      min: 8
-      max: 200
-    memory:
-      min: 32
-      max: 1024
-```
-
-含义是：
-
-```text
-目标 workload cluster 的节点 CPU 总量不能超过 200 cores
-缩容后不应低于 8 cores
-
-目标 workload cluster 的节点 memory 总量不能超过 1024 GiB
-缩容后不应低于 32 GiB
-```
-
-它们分别翻译为社区 Cluster Autoscaler 的 `--cores-total=8:200` 和 `--memory-total=32:1024`。`memory-total` 使用 GiB 级别的整数表达，ACP CRD 应在 API 文档中固定单位，避免和 Kubernetes `resource.Quantity` 字符串混用造成歧义。
-
-`max` 主要限制继续扩容，`min` 主要限制继续缩容。如果当前集群已经超过这些边界，Cluster Autoscaler 通常不会主动把集群修正回范围内；这些配置主要影响后续扩缩容决策。
-
-它和单个 node group 的 min/max 不同：
-
-| 配置 | 作用范围 | 示例 |
+| ACP 字段 | 目标资源 / 参数 | 示例 |
 |---|---|---|
-| `ClusterAutoscaler.resourceLimits.cores.max` | 目标 workload cluster 的集群级 CPU 上限 | 目标集群所有节点最多 200 cores |
-| `MachineAutoscaler.maxReplicas` | 单个 node group 的副本数上限 | `worker-md-0` 最多 10 台 |
+| `clusterRef` / `nodeGroupDiscovery` | CA args | `--node-group-auto-discovery=clusterapi:namespace=provider-cluster-a,clusterName=provider-cluster-a` |
+| `workloadKubeconfigRef` | Secret volume + CA args | `--kubeconfig=/etc/autoscaler/workload/kubeconfig` |
+| `managementKubeconfigRef` | Secret volume + CA args | `--cloud-config=/etc/autoscaler/management/kubeconfig` |
+| `resourceLimits.maxNodesTotal` | CA args | `--max-nodes-total=100` |
+| `resourceLimits.cores` | CA args | `--cores-total=8:200` |
+| `resourceLimits.memory` | CA args | `--memory-total=32:1024` |
+| `scaleDown.enabled` | CA args | `--scale-down-enabled=true` |
+| `scaleDown.unneededTime` | CA args | `--scale-down-unneeded-time=10m` |
+| `scaleDown.utilizationThreshold` | CA args | `--scale-down-utilization-threshold=0.5` |
+| `expander.strategies` | CA args | `--expander=priority,least-waste` |
+| `expander.priorityConfig` | workload cluster ConfigMap | `cluster-autoscaler-priority-expander` |
+| `deployment.image` | Deployment | `spec.template.spec.containers[].image` |
+| `deployment.resources` | Deployment | `resources.requests/limits` |
+| `deployment.logLevel` | CA args | `--v=4` |
 
-### 6.3 ACP MachineAutoscaler：对齐 OCP 的节点组级 min/max
+### 5.5 priority expander 处理
 
-ACP `MachineAutoscaler` 表达单个 CAPI `MachineDeployment` 的 autoscaler 边界。CR 的存在和有效配置表示该 `MachineDeployment` 开启 autoscaler。
+社区 priority expander 固定读取名为 `cluster-autoscaler-priority-expander` 的 ConfigMap。该 ConfigMap 位于 Cluster Autoscaler 通过 `--kubeconfig` 访问的 workload cluster 中，namespace 由 `--namespace` 指定。
 
-为对齐 OCP `MachineAutoscaler` 行为，ACP `MachineAutoscaler` 与目标 CAPI `MachineDeployment` 建议保持一对一关系，`scaleTargetRef` 只携带 `apiVersion`、`kind` 和 `name`，不扩展 namespace 字段。区别在于，ACP 的产品层 CR 统一位于 global 集群的 `cpaas-system` namespace，不复用 OCP “`MachineAutoscaler` 与目标 `MachineSet` 同 namespace”这一部署约束；目标业务集群和目标 CAPI namespace 应通过 `MachineAutoscaler.spec.clusterRef` 解析，通常与对应 `ClusterAutoscaler.spec.clusterRef` 指向同一个 CAPI `Cluster`。`MachineAutoscaler.metadata.name` 建议与目标 `MachineDeployment.metadata.name` 保持一致，便于用户理解、查询和排障；真正的目标对象仍以 `spec.clusterRef` + `spec.scaleTargetRef` 为准。
+ACP 不要求用户直接维护这个 ConfigMap。用户在 `ClusterAutoscaler.spec.expander.priorityConfig` 中配置优先级，`autoscaler-manager` 使用 workload kubeconfig 同步到底层 ConfigMap。
 
-`MachineAutoscaler.spec.clusterRef` 是必填字段，用于指向目标业务集群对应的 CAPI `Cluster`。`autoscaler-manager` 通过 `clusterRef.namespace` 定位目标 CAPI namespace，并在该 namespace 下查找 `scaleTargetRef.name` 对应的 `MachineDeployment`。ACP 初版要求目标 `MachineDeployment` 与 `clusterRef` 指向的 CAPI `Cluster` 位于同一 namespace，不支持跨 namespace 引用 node group。
+如果 ConfigMap 同步失败或格式校验失败：
 
-它对齐 OCP `MachineAutoscaler` 的产品语义：用户不直接编辑底层 node group annotation，而是通过一个面向节点组的产品层 CR 声明 min/max。区别在于 OCP 的目标对象是 OpenShift `MachineSet`，ACP 初版的目标对象是 CAPI `MachineDeployment`。
+- `autoscaler-manager` 应在 `ClusterAutoscaler.status.conditions` 中暴露错误。
+- 社区 CA 可能跳过 priority expander，并继续使用 expander 链中的后续策略，例如 `least-waste`。
+
+## 6. MachineAutoscaler CRD
+
+`MachineAutoscaler` 表达单个 CAPI `MachineDeployment` 的 autoscaler 边界。CR 的存在和有效配置表示该 `MachineDeployment` 允许自动扩缩容。
+
+它对齐 OCP `MachineAutoscaler` 的产品语义：用户不直接编辑底层 node group annotation，而是通过面向节点组的产品层 CR 声明 min/max。区别在于 OCP 的目标对象是 OpenShift `MachineSet`，ACP 初版目标对象是 CAPI `MachineDeployment`。
+
+### 6.1 示例
 
 ```yaml
 apiVersion: autoscaling.acp.example.io/v1alpha1
@@ -730,55 +404,13 @@ spec:
   maxReplicas: 10
 ```
 
-`autoscaler-manager` 将 `minReplicas` / `maxReplicas` 翻译为目标 CAPI `MachineDeployment` 上的 autoscaler annotations：
-
-```yaml
-metadata:
-  annotations:
-    cluster.x-k8s.io/cluster-api-autoscaler-node-group-min-size: "1"
-    cluster.x-k8s.io/cluster-api-autoscaler-node-group-max-size: "10"
-```
-
-对于普通扩缩容，`NodeGroupProfile` 不是必需对象。只要 node group 当前有可参考的 Node，或者 CAPI provider 已经能提供足够的模板信息，Cluster Autoscaler 就可以完成常规扩容和缩容。
-
-### 6.4 ACP NodeGroupProfile：从 0 扩容的可选增强
-
-从 0 扩容是 ACP autoscaling 的可选增强能力，不应作为所有 provider 的基础要求。
-
-如果一个 `MachineDeployment` 当前没有任何 Node，Cluster Autoscaler 需要额外知道“这个节点组新扩出来的节点会长什么样”。这些信息来自 provider-specific 模板，但不同 provider 的规格信息存放位置不同：
-
-```text
-vSphere 可能在 VM class / template / hardware profile 中
-HCS / DCS 可能在自己的 flavor / SKU / profile 中
-云 provider 可能在 instanceType 中
-裸金属 provider 可能依赖 BareMetalHost inventory
-```
-
-因此，ACP 不建议让 `autoscaler-manager` 直接解析所有 provider-specific 模板，而是引入一个 provider 侧同步的标准化对象：`NodeGroupProfile`。
-
-`NodeGroupProfile` 表示“某个 node group 新扩出来的节点具备哪些调度属性”。它不是 Kubernetes Node 模板，也不是 CAPI `MachineTemplate`，而是 ACP 为从 0 扩容准备的 node group 调度画像。
-
-`NodeGroupProfile` 由 provider controller 生成 / 同步，位于 global 集群 `cpaas-system` namespace。为降低引用复杂度，ACP 初版要求 `NodeGroupProfile` 与引用它的 `MachineAutoscaler` 位于同一 namespace，并且 `NodeGroupProfile.metadata.name` 与目标 `MachineDeployment.metadata.name` 保持一致。`MachineAutoscaler.spec.nodeGroupProfileRef` 只引用同 namespace 下的 `NodeGroupProfile` 名称，不扩展 namespace 字段。
-
-从 0 扩容的前提是：
-
-```text
-目标 MachineDeployment replicas 可以为 0
-+
-ACP MachineAutoscaler 允许 minReplicas: 0
-+
-provider 已上报 ready 的 NodeGroupProfile
-+
-NodeGroupProfile 能准确描述新节点调度属性
-```
-
-此时 `MachineAutoscaler` 可以引用 `NodeGroupProfile`：
+从 0 扩容示例：
 
 ```yaml
 apiVersion: autoscaling.acp.example.io/v1alpha1
 kind: MachineAutoscaler
 metadata:
-  name: worker-md-0
+  name: gpu-md-0
   namespace: cpaas-system
 spec:
   clusterRef:
@@ -789,160 +421,432 @@ spec:
   scaleTargetRef:
     apiVersion: cluster.x-k8s.io/v1beta1
     kind: MachineDeployment
-    name: worker-md-0
+    name: gpu-md-0
   minReplicas: 0
-  maxReplicas: 10
+  maxReplicas: 5
   nodeGroupProfileRef:
-    apiVersion: autoscaling.acp.example.io/v1alpha1
-    kind: NodeGroupProfile
-    name: worker-md-0
+    name: gpu-md-0
 ```
 
-`NodeGroupProfile` 由 provider controller 同步，用于解决从 0 扩容时“没有现有 Node 可参考”的问题。
+### 6.2 spec 字段定义
+
+| 字段 | 类型 | 必需 | 含义 |
+|---|---|---|---|
+| `spec.clusterRef` | `ObjectReference` | 是 | 指向目标业务集群对应的 CAPI `Cluster`。用于确定目标 `MachineDeployment` 所在 CAPI namespace，并关联到对应 `ClusterAutoscaler`。 |
+| `spec.clusterRef.apiVersion` | `string` | 是 | 目标 CAPI `Cluster` 的 API 版本。 |
+| `spec.clusterRef.kind` | `string` | 是 | 目标对象类型，初版固定为 `Cluster`。 |
+| `spec.clusterRef.namespace` | `string` | 是 | 目标 CAPI `Cluster` namespace。初版要求目标 `MachineDeployment` 与该 `Cluster` 位于同一 namespace。 |
+| `spec.clusterRef.name` | `string` | 是 | 目标 CAPI `Cluster` 名称。 |
+| `spec.scaleTargetRef` | `ScaleTargetReference` | 是 | 指向要自动扩缩容的 CAPI node group。初版只支持 `MachineDeployment`。 |
+| `spec.scaleTargetRef.apiVersion` | `string` | 是 | 目标 node group API 版本，例如 `cluster.x-k8s.io/v1beta1`。 |
+| `spec.scaleTargetRef.kind` | `string` | 是 | 目标 node group 类型，初版固定为 `MachineDeployment`。 |
+| `spec.scaleTargetRef.name` | `string` | 是 | 目标 `MachineDeployment` 名称。不包含 namespace，namespace 由 `clusterRef.namespace` 推导。 |
+| `spec.minReplicas` | `int32` | 是 | node group 最小副本数。翻译为 CAPI autoscaler min-size annotation。值为 `0` 时表示允许从 0 扩容，需要额外满足 `NodeGroupProfile` ready。 |
+| `spec.maxReplicas` | `int32` | 是 | node group 最大副本数。翻译为 CAPI autoscaler max-size annotation。必须大于等于 `minReplicas`。 |
+| `spec.nodeGroupProfileRef` | `LocalObjectReference` | 条件必需 | 从 0 扩容时引用同 namespace 下的 `NodeGroupProfile`。当 `minReplicas: 0` 且 provider 不能通过 infra template status 提供完整模板信息时必填；ACP 初版建议直接要求必填。 |
+| `spec.nodeGroupProfileRef.name` | `string` | 条件必需 | `NodeGroupProfile` 名称，建议与目标 `MachineDeployment` 名称一致。 |
+
+### 6.3 status 字段定义
+
+| 字段 | 类型 | 含义 |
+|---|---|---|
+| `status.observedGeneration` | `int64` | controller 最近处理过的 `metadata.generation`。 |
+| `status.conditions` | `[]Condition` | 标准 conditions，用于表达 Ready、TargetFound、AnnotationsSynced、ScaleFromZeroReady、ProfileReady 等状态。 |
+| `status.conditions[].type` | `string` | condition 类型，例如 `Ready`、`TargetFound`、`AnnotationsSynced`、`ScaleFromZeroReady`。 |
+| `status.conditions[].status` | `True/False/Unknown` | condition 状态。 |
+| `status.conditions[].reason` | `string` | 机器可读原因，例如 `MachineDeploymentNotFound`、`InvalidReplicaRange`、`NodeGroupProfileNotReady`。 |
+| `status.conditions[].message` | `string` | 面向人的状态说明。 |
+| `status.conditions[].lastTransitionTime` | `Time` | condition 最近一次状态变化时间。 |
+| `status.targetRef` | `ObjectReference` | 实际解析到的目标 `MachineDeployment` 引用。 |
+| `status.currentReplicas` | `int32` | 目标 `MachineDeployment.status.replicas` 或当前可观测副本数。 |
+| `status.minReplicas` | `int32` | 最近一次成功同步到目标 `MachineDeployment` annotation 的 min。 |
+| `status.maxReplicas` | `int32` | 最近一次成功同步到目标 `MachineDeployment` annotation 的 max。 |
+| `status.lastSyncedAnnotations` | `map[string]string` | 最近一次由 `autoscaler-manager` 写入的关键 autoscaler annotations。 |
+| `status.message` | `string` | 聚合后的简短状态说明。 |
+
+### 6.4 翻译规则
+
+`autoscaler-manager` 将 `MachineAutoscaler` 的 min/max 写入目标 `MachineDeployment` annotations：
+
+```yaml
+metadata:
+  annotations:
+    cluster.x-k8s.io/cluster-api-autoscaler-node-group-min-size: "1"
+    cluster.x-k8s.io/cluster-api-autoscaler-node-group-max-size: "10"
+```
+
+规则：
+
+1. `MachineAutoscaler` 与目标 `MachineDeployment` 一对一。
+2. 初版只允许 `scaleTargetRef.kind=MachineDeployment`。
+3. `autoscaler-manager` 通过 `clusterRef.namespace` 查找目标 `MachineDeployment`。
+4. 当 `minReplicas > 0` 时，不要求 `NodeGroupProfile` 存在。
+5. 当 `minReplicas = 0` 时，ACP 初版建议要求 `nodeGroupProfileRef` 存在且目标 `NodeGroupProfile` ready。
+6. `minReplicas > maxReplicas` 应被 admission 或 controller 拒绝，并在 status 中标记不可用。
+7. 如果目标 `MachineDeployment` 不存在或不属于 `clusterRef` 指向的 CAPI `Cluster`，应标记 `TargetFound=False`。
+
+## 7. NodeGroupProfile CRD
+
+`NodeGroupProfile` 是 ACP 为从 0 扩容提出的可选产品层抽象，用于描述某个 node group 新扩出来的节点具备哪些调度属性。
+
+它不是 Kubernetes Node 模板，也不是 CAPI `MachineTemplate`。它只服务于 Cluster Autoscaler 的调度模拟。
+
+### 7.1 为什么需要 NodeGroupProfile
+
+普通扩缩容通常可以从已有 Node 推断节点能力。但当 `MachineDeployment.replicas=0` 时，没有现成 Node 可参考，Cluster Autoscaler 需要额外知道新节点的 CPU、memory、labels、taints、GPU、topology 等信息。
+
+这些信息在不同 provider 中来源不同：
+
+```text
+vSphere 可能在 VM class / template / hardware profile 中
+HCS / DCS 可能在 flavor / SKU / profile 中
+云 provider 可能在 instanceType 中
+裸金属 provider 可能依赖 BareMetalHost inventory
+```
+
+ACP 不建议让 `autoscaler-manager` 解析所有 provider-specific 模板，而是由 provider controller 同步标准化的 `NodeGroupProfile`。
+
+### 7.2 示例
 
 ```yaml
 apiVersion: autoscaling.acp.example.io/v1alpha1
 kind: NodeGroupProfile
 metadata:
-  name: worker-md-0
+  name: gpu-md-0
   namespace: cpaas-system
 spec:
+  clusterRef:
+    apiVersion: cluster.x-k8s.io/v1beta1
+    kind: Cluster
+    namespace: provider-cluster-a
+    name: provider-cluster-a
+  scaleTargetRef:
+    apiVersion: cluster.x-k8s.io/v1beta1
+    kind: MachineDeployment
+    name: gpu-md-0
   capacity:
     cpu: "16"
     memory: "64Gi"
+    ephemeralStorage: "100Gi"
     maxPods: 110
   labels:
     topology.kubernetes.io/zone: zone-a
     workload: batch
+    node-type: gpu
   taints:
     - key: workload
       value: batch
       effect: NoSchedule
+  volumeLimits:
+    - csiDriver: ebs.csi.aws.com
+      count: 25
   accelerators:
     - resourceName: nvidia.com/gpu
       count: 1
+      type: gpu
+status:
+  observedGeneration: 1
+  conditions:
+    - type: Ready
+      status: "True"
+      reason: ProfileSynced
+      message: Node group profile is ready for scale from zero.
 ```
 
-`autoscaler-manager` 在 `NodeGroupProfile` ready 后，才把它翻译为 CAPI capacity annotations，例如 CPU、memory、labels、taints、topology、GPU 等。如果没有 `NodeGroupProfile`，或 `NodeGroupProfile` 未 ready，ACP 应该明确阻止或标记 `minReplicas: 0` 配置不可用，而不是让用户误以为所有 provider 都天然支持从 0 扩容。
+### 7.3 spec 字段定义
 
-ACP 引入 `NodeGroupProfile` 是产品层标准化选择，用来统一不同 provider 的输出并由 `autoscaler-manager` 写入 annotations；它不是 upstream `clusterapi` provider 唯一支持的信息来源。无论信息来自哪里，CPU 和 memory capacity 都是从 0 扩容的最低要求。
+| 字段 | 类型 | 必需 | 含义 |
+|---|---|---|---|
+| `spec.clusterRef` | `ObjectReference` | 是 | 指向目标业务集群对应的 CAPI `Cluster`，用于确认该 profile 属于哪个 workload cluster。 |
+| `spec.clusterRef.apiVersion` | `string` | 是 | 目标 CAPI `Cluster` 的 API 版本。 |
+| `spec.clusterRef.kind` | `string` | 是 | 目标对象类型，初版固定为 `Cluster`。 |
+| `spec.clusterRef.namespace` | `string` | 是 | 目标 CAPI `Cluster` namespace。 |
+| `spec.clusterRef.name` | `string` | 是 | 目标 CAPI `Cluster` 名称。 |
+| `spec.scaleTargetRef` | `ScaleTargetReference` | 是 | 指向该 profile 描述的 node group。初版只支持 `MachineDeployment`。 |
+| `spec.scaleTargetRef.apiVersion` | `string` | 是 | 目标 node group API 版本。 |
+| `spec.scaleTargetRef.kind` | `string` | 是 | 目标 node group 类型，初版固定为 `MachineDeployment`。 |
+| `spec.scaleTargetRef.name` | `string` | 是 | 目标 `MachineDeployment` 名称。 |
+| `spec.capacity` | `NodeCapacity` | 是 | 新节点的资源容量。CPU 和 memory 是从 0 扩容调度模拟的最低要求。 |
+| `spec.capacity.cpu` | `Quantity` | 是 | 新节点 CPU capacity，例如 `16` 或 `16000m`，翻译为 `capacity.cluster-autoscaler.kubernetes.io/cpu`。 |
+| `spec.capacity.memory` | `Quantity` | 是 | 新节点 memory capacity，例如 `64Gi`，翻译为 `capacity.cluster-autoscaler.kubernetes.io/memory`。 |
+| `spec.capacity.ephemeralStorage` | `Quantity` | 否 | 新节点临时存储 capacity，翻译为 `capacity.cluster-autoscaler.kubernetes.io/ephemeral-disk`。 |
+| `spec.capacity.maxPods` | `int32` | 否 | 新节点最大 Pod 数，翻译为 `capacity.cluster-autoscaler.kubernetes.io/maxPods`。未设置时社区 CA 通常按 `110` 处理。 |
+| `spec.labels` | `map[string]string` | 否 | 新节点预期 labels，用于模拟 `nodeSelector` / node affinity / topology 约束，翻译为 capacity labels annotation。 |
+| `spec.taints` | `[]Taint` | 否 | 新节点预期 taints，用于模拟 tolerations，翻译为 capacity taints annotation。 |
+| `spec.taints[].key` | `string` | 是 | taint key。 |
+| `spec.taints[].value` | `string` | 否 | taint value。 |
+| `spec.taints[].effect` | `string` | 是 | taint effect，例如 `NoSchedule`、`PreferNoSchedule`、`NoExecute`。 |
+| `spec.volumeLimits` | `[]VolumeLimit` | 否 | 新节点的 CSI volume limit 信息。 |
+| `spec.volumeLimits[].csiDriver` | `string` | 是 | CSI driver 名称，例如 `ebs.csi.aws.com`。 |
+| `spec.volumeLimits[].count` | `int32` | 是 | 该 CSI driver 在单节点上的 volume 数量上限。 |
+| `spec.accelerators` | `[]Accelerator` | 否 | 新节点的 GPU 或其他加速器信息。 |
+| `spec.accelerators[].resourceName` | `string` | 是 | Kubernetes extended resource 名称，例如 `nvidia.com/gpu`。 |
+| `spec.accelerators[].count` | `int32` | 是 | 该资源在新节点上的数量。 |
+| `spec.accelerators[].type` | `string` | 否 | 加速器类型说明，例如 `gpu`。用于产品展示或 provider 内部校验。 |
+| `spec.accelerators[].draDriver` | `string` | 否 | Kubernetes DRA 场景下的 driver 名称。传统 device plugin 场景可不填。 |
+| `spec.providerTemplateRef` | `ObjectReference` | 否 | provider controller 用于生成该 profile 的底层模板引用，例如 VM class、flavor 或 CAPI infra template。用于审计和漂移检测。 |
+| `spec.providerTemplateRef.apiVersion` | `string` | 条件必需 | 底层模板 API 版本。填写 `providerTemplateRef` 时必填。 |
+| `spec.providerTemplateRef.kind` | `string` | 条件必需 | 底层模板类型。填写 `providerTemplateRef` 时必填。 |
+| `spec.providerTemplateRef.namespace` | `string` | 否 | 底层模板 namespace。 |
+| `spec.providerTemplateRef.name` | `string` | 条件必需 | 底层模板名称。填写 `providerTemplateRef` 时必填。 |
 
-建议 `NodeGroupProfile` 至少暴露 `Ready` 或 `ScaleFromZeroReady` condition，并在 provider 模板变化但 `NodeGroupProfile` 尚未同步时暴露 drift 状态。
+### 7.4 status 字段定义
 
-### 6.5 provider 与 autoscaler-manager 的职责边界
+| 字段 | 类型 | 含义 |
+|---|---|---|
+| `status.observedGeneration` | `int64` | provider controller 最近处理过的 `metadata.generation`。 |
+| `status.conditions` | `[]Condition` | 标准 conditions，用于表达 Ready、Synced、Drifted、TemplateResolved、CapacityResolved 等状态。 |
+| `status.conditions[].type` | `string` | condition 类型，例如 `Ready`、`Drifted`、`TemplateResolved`。 |
+| `status.conditions[].status` | `True/False/Unknown` | condition 状态。 |
+| `status.conditions[].reason` | `string` | 机器可读原因，例如 `ProfileSynced`、`TemplateNotFound`、`CapacityMissing`、`TemplateDrifted`。 |
+| `status.conditions[].message` | `string` | 面向人的状态说明。 |
+| `status.conditions[].lastTransitionTime` | `Time` | condition 最近一次状态变化时间。 |
+| `status.sourceHash` | `string` | provider controller 根据底层模板计算的 hash，用于识别 profile 是否与真实模板一致。 |
+| `status.lastSyncedTime` | `Time` | 最近一次成功同步 profile 的时间。 |
+| `status.message` | `string` | 聚合后的简短状态说明。 |
 
-`NodeGroupProfile` 不应由用户手工从 provider 模板里抄写出来，否则容易和真实 MachineTemplate 漂移。
+### 7.5 翻译规则
 
-更合理的职责拆分是：
+当 `MachineAutoscaler.spec.minReplicas=0` 且 `NodeGroupProfile` ready 时，`autoscaler-manager` 将 profile 翻译为目标 `MachineDeployment` 的 scale-from-zero annotations。
+
+示例：
+
+```yaml
+metadata:
+  annotations:
+    cluster.x-k8s.io/cluster-api-autoscaler-node-group-min-size: "0"
+    cluster.x-k8s.io/cluster-api-autoscaler-node-group-max-size: "5"
+    capacity.cluster-autoscaler.kubernetes.io/cpu: "16"
+    capacity.cluster-autoscaler.kubernetes.io/memory: "64Gi"
+    capacity.cluster-autoscaler.kubernetes.io/ephemeral-disk: "100Gi"
+    capacity.cluster-autoscaler.kubernetes.io/maxPods: "110"
+    capacity.cluster-autoscaler.kubernetes.io/labels: "topology.kubernetes.io/zone=zone-a,workload=batch,node-type=gpu"
+    capacity.cluster-autoscaler.kubernetes.io/taints: "workload=batch:NoSchedule"
+    capacity.cluster-autoscaler.kubernetes.io/csi-driver: "ebs.csi.aws.com=25"
+    capacity.cluster-autoscaler.kubernetes.io/gpu-type: "nvidia.com/gpu"
+    capacity.cluster-autoscaler.kubernetes.io/gpu-count: "1"
+```
+
+规则：
+
+1. CPU 和 memory 缺失时，`NodeGroupProfile` 不应 ready。
+2. `NodeGroupProfile` 未 ready 时，`autoscaler-manager` 不应把 `minReplicas: 0` 标记为可用。
+3. provider 模板变化但 profile 未同步时，provider controller 应标记 `Drifted=True`。
+4. `autoscaler-manager` 看到 drift 状态后，应在 `MachineAutoscaler.status` 中暴露风险。
+5. DRA 场景使用 `draDriver`；传统 device plugin 场景使用 `resourceName` 翻译为 `gpu-type`，不要让两者同时代表同一个 GPU 资源。
+
+## 8. autoscaler-manager 设计
+
+`autoscaler-manager` 是 ACP 新增 controller，负责产品层 CRD 与底层社区 Cluster Autoscaler / CAPI annotations 之间的翻译。
+
+### 8.1 职责
+
+`autoscaler-manager` 负责：
+
+- watch `ClusterAutoscaler`，为目标 workload cluster 创建、更新或删除一套社区 Cluster Autoscaler 实例。
+- 管理该实例所需的 Deployment、ServiceAccount、RBAC、Secret mount、ConfigMap 和 container args。
+- watch `MachineAutoscaler`，把 min/max 同步到目标 CAPI `MachineDeployment` annotations。
+- watch `NodeGroupProfile`，在从 0 扩容场景下把新节点调度画像同步为 capacity annotations。
+- 使用 workload kubeconfig 同步 priority expander ConfigMap。
+- 在 status 中暴露部署失败、kubeconfig 不可用、annotation 写入失败、目标对象不存在、profile 未 ready、profile drift 等问题。
+
+`autoscaler-manager` 不负责：
+
+- 不读取 Pending Pod 并做扩容决策。
+- 不 drain Node。
+- 不直接创建或删除 VM / 裸金属主机。
+- 不解析所有 provider-specific 机器模板。
+
+### 8.2 reconcile ClusterAutoscaler
+
+当 `ClusterAutoscaler.spec.enabled=true`：
+
+1. 校验 `clusterRef`、kubeconfig Secret 和 provider 支持矩阵。
+2. 创建或更新社区 CA Deployment。
+3. 创建或更新 ServiceAccount / RBAC。
+4. 挂载 workload kubeconfig 和可选 management kubeconfig。
+5. 生成 container args：
+   - `--cloud-provider=clusterapi`
+   - `--node-group-auto-discovery=clusterapi:namespace=<namespace>,clusterName=<clusterName>`
+   - `--kubeconfig=<workload-kubeconfig-path>`
+   - `--cloud-config=<management-kubeconfig-path>` 或使用 in-cluster config
+   - resource limits / scale down / expander / logging flags
+6. 如启用 priority expander，同步 workload cluster 中固定名称 ConfigMap。
+7. 更新 `ClusterAutoscaler.status`。
+
+当 `ClusterAutoscaler.spec.enabled=false`：
+
+- 删除或暂停对应社区 CA 实例。
+- 保留 `MachineAutoscaler` CR 本身，但不再让 CA 执行实时扩缩容。
+- 在 status 中说明当前 disabled。
+
+### 8.3 reconcile MachineAutoscaler
+
+1. 通过 `clusterRef` 找到目标 CAPI namespace 和对应 `ClusterAutoscaler`。
+2. 校验 `scaleTargetRef.kind=MachineDeployment`。
+3. 查找目标 `MachineDeployment`。
+4. 校验 `minReplicas <= maxReplicas`。
+5. 写入 min/max annotations。
+6. 如果 `minReplicas=0`：
+   - 查找 `nodeGroupProfileRef`。
+   - 校验 `NodeGroupProfile` ready 且未 drift。
+   - 写入 capacity annotations。
+7. 更新 `MachineAutoscaler.status`。
+
+### 8.4 reconcile NodeGroupProfile
+
+`NodeGroupProfile` 的主 owner 应是 provider controller，不是 `autoscaler-manager`。`autoscaler-manager` 只消费它：
+
+1. watch profile 变化。
+2. 找到引用该 profile 的 `MachineAutoscaler`。
+3. 如果 profile ready，触发对应 `MachineAutoscaler` reconcile。
+4. 如果 profile drift 或 not ready，更新对应 `MachineAutoscaler.status` 并避免宣称从 0 扩容可用。
+
+## 9. 普通扩缩容流程
+
+普通扩缩容不要求 `NodeGroupProfile`。
 
 ```text
-provider controller
-  -> 理解自己的 MachineTemplate / flavor / SKU / profile
-  -> 同步标准化 NodeGroupProfile
-  -> 保证 NodeGroupProfile 与真实节点模板一致
+用户创建 ClusterAutoscaler
+  -> autoscaler-manager 部署社区 CA
 
-autoscaler-manager
-  -> 不解析 provider-specific 模板
-  -> 只消费 MachineAutoscaler + NodeGroupProfile
-  -> 写入社区 Cluster Autoscaler CAPI provider 能识别的 annotations
+用户创建 MachineAutoscaler(min=1,max=10)
+  -> autoscaler-manager 写入 MachineDeployment min/max annotations
+
+workload cluster 出现 Pending Pod
+  -> 社区 CA 读取 Pending Pod / Node / PDB
+  -> 社区 CA 发现可扩容 MachineDeployment
+  -> 社区 CA 模拟新增节点
+  -> 社区 CA 调整 MachineDeployment.replicas
+  -> CAPI / provider controller 创建 Machine / InfraMachine
+  -> 新 Node 加入 workload cluster
 ```
 
-这样可以避免每个 provider 都去实现 Cluster Autoscaler cloud provider，同时也避免通用 ACP controller 直接理解所有 provider-specific 字段。
-
-`autoscaler-manager` 建议作为 ACP control plane 中的独立 controller，而不是开发新的 Cluster Autoscaler cloud provider。职责包括：
-
-- watch `ClusterAutoscaler` CR，为目标业务集群创建、更新或删除一套社区 Cluster Autoscaler 实例。
-- 管理该 autoscaler 实例所需的 Deployment、ConfigMap、Secret mount、ServiceAccount / RBAC、container args 等底层资源。
-- watch `MachineAutoscaler`、可选 `NodeGroupProfile` 和目标 CAPI `MachineDeployment`。
-- 根据 `MachineAutoscaler.spec.minReplicas` / `maxReplicas` 写入目标 `MachineDeployment` 的 CAPI node group min/max annotations。
-- 普通扩缩容场景下，不要求 `NodeGroupProfile` 存在。
-- 从 0 扩容场景下，只有 `nodeGroupProfileRef` 存在且 `NodeGroupProfile` ready 时，才把调度画像翻译为 scale-from-zero 所需 capacity annotations 并写入目标 `MachineDeployment`。
-- 在 `minReplicas: 0` 但 `NodeGroupProfile` 缺失或未 ready 时，阻止或标记配置不可用。
-- 通过 status / condition 暴露 autoscaler 实例部署结果、annotation 同步结果、冲突、模板缺失、模板漂移和写入失败等问题。
-
-对应关系可以理解为：
+缩容流程：
 
 ```text
-ClusterAutoscaler
-  -> 每个 provider 业务集群一份
-  -> 声明是否给该业务集群部署 autoscaler 实例
-  -> 声明 workload kubeconfig / management kubeconfig
-  -> 声明该 autoscaler 实例的集群级参数
-
-MachineAutoscaler
-  -> 每个可扩缩容 MachineDeployment 一份
-  -> product CR 位于 global 集群 cpaas-system namespace
-  -> 通过 clusterRef 归属于某个业务集群，并解析目标 CAPI namespace
-  -> scaleTargetRef 只引用该集群下的目标 MachineDeployment 名称
-  -> 声明 node group min/max
-
-NodeGroupProfile
-  -> 可选
-  -> 由 provider controller 生成 / 同步
-  -> 与引用它的 MachineAutoscaler 位于同一 namespace
-  -> 名称与目标 MachineDeployment 保持一致
-  -> 只有从 0 扩容需要
+社区 CA 发现低利用率 Node
+  -> 判断 Pod 是否可驱逐
+  -> 模拟 Pod 是否能迁移到其他 Node
+  -> cordon / drain Node
+  -> 调整 MachineDeployment.replicas 或删除 Machine
+  -> CAPI / provider controller 删除底层资源
 ```
 
-如果 `ClusterAutoscaler.spec.enabled=false`，或者目标业务集群类型不在已验证支持 autoscaling 语义的 CAPI provider 支持矩阵内，`autoscaler-manager` 应删除或不创建对应 autoscaler 实例，并在 `ClusterAutoscaler.status` 中说明原因。
+ACP 需要在产品层暴露缩容阻塞原因，但不重新实现缩容判断。
 
-## 7. 关键风险与待确认项
+## 10. 从 0 扩容流程
 
-1. 目标 Cluster Autoscaler / CAPI provider 版本是否支持 ACP 初版选定的 `MachineDeployment` autoscaling 路径，包括 min/max annotations、auto discovery 和删除语义。
-2. 从 0 扩容所需的 capacity annotations 或 infra template `status.capacity` / `status.nodeSystemInfo` 是否在目标版本可用。
-3. Machine / Node `providerID` 映射是否稳定；如果映射不正确，Cluster Autoscaler 无法可靠判断 Node 属于哪个 node group。
-4. 删除 CAPI `Machine` 是否可靠释放底层 VM、实例或裸金属资源；缩容最终依赖 provider 删除语义。
-5. priority expander 的 ConfigMap 名称固定为 `cluster-autoscaler-priority-expander`，且位于 workload cluster 的 `--namespace` 指定 namespace；`autoscaler-manager` 需要使用 workload kubeconfig 同步该 ConfigMap 并暴露同步失败状态。
-6. `minReplicas: 0` 不应作为所有 provider 的默认能力；只有 provider 能提供准确的新节点调度画像时才应开放。
-7. `NodeGroupProfile` 如果由 provider 同步，必须暴露 ready / drift 等状态，避免真实 MachineTemplate 已变化但 autoscaler 使用旧画像做调度模拟。
-8. baremetal provider 如果要纳入 autoscaling，需要单独确认节点库存、capacity、删除语义、Machine / Node `providerID` 映射以及从 0 扩容模板来源；ACP 初版暂不纳入。
-9. `maxNodesTotal`、`cores-total`、`memory-total` 是目标 workload cluster 维度的总量边界，不是只统计 `MachineAutoscaler` 管理的节点组，也不等价于 ACP 平台 quota。
-10. Cluster Autoscaler 缩容会触发 Pod 驱逐和节点删除，ACP 需要在产品层暴露缩容阻塞原因、驱逐风险、资源上限阻塞和 provider 删除失败等状态。
+从 0 扩容是可选增强能力。
 
-## 8. 最终建议
-
-推荐落地路径：
-
-1. 以社区 Cluster Autoscaler + `clusterapi` cloud provider 作为 ACP autoscaling 基础能力。
-2. 使用 CAPI `MachineDeployment` 作为 ACP 初版唯一的 worker node group 抽象；`MachineAutoscaler` 只引用 `MachineDeployment`，`autoscaler-manager` 只向 `MachineDeployment` 写入 autoscaler annotations。
-3. 提供 ACP `ClusterAutoscaler` CRD 声明目标业务集群、是否启用 autoscaler 以及集群级配置，由 `autoscaler-manager` 为该业务集群部署对应的社区 Cluster Autoscaler Deployment / ConfigMap / RBAC / flags。
-4. 提供 ACP `MachineAutoscaler` CRD 作为节点组级单一事实源；每个 `MachineAutoscaler` 位于 global 集群 `cpaas-system` namespace，通过 `clusterRef` 归属到目标业务集群，并通过 OCP 风格的 `scaleTargetRef.apiVersion/kind/name` 引用一个目标 `MachineDeployment`，配置 `minReplicas` / `maxReplicas`。
-5. 先实现普通扩缩容：`MachineAutoscaler` 负责 min/max，`autoscaler-manager` watch `MachineAutoscaler` 并写入目标 `MachineDeployment` 的 CAPI min/max annotations；该能力不要求 provider 上报 `NodeGroupProfile`。
-6. 将从 0 扩容作为可选增强能力：只有 provider 能持续上报 ready 的 `NodeGroupProfile` 时，才允许对应 `MachineAutoscaler` 使用 `minReplicas: 0`。
-7. `autoscaler-manager` 在从 0 扩容场景下，把 ready 的 `NodeGroupProfile` 翻译为 CAPI capacity annotations；普通扩缩容场景下不写或不依赖这些 annotations。
-8. `priority` expander 通过 ACP `ClusterAutoscaler.spec.priorityExpanderConfig` 产品化；`autoscaler-manager` 将该配置同步为 workload cluster 指定 namespace 下固定名称的 `cluster-autoscaler-priority-expander` ConfigMap，并在状态中暴露同步或格式错误。
-9. 确认目标 Cluster Autoscaler / CAPI provider 版本支持 `MachineDeployment`、min/max annotations、从 0 扩容所需 capacity annotations 和删除语义。
-10. 确保 Machine / Node `providerID` 映射正确。
-11. 确保删除 Machine 能正确释放底层资源。
-12. 在 ACP 层提供缩容阻塞原因、模板缺失、模板漂移、资源上限阻塞和 annotation 同步失败的可观测性。
-
-一句话结论：
+前提：
 
 ```text
-ACP 应采用社区 Cluster Autoscaler + CAPI provider 作为底层方案，先支持不依赖 NodeGroupProfile 的普通扩缩容；从 0 扩容作为可选增强能力，仅在 provider 上报 ready NodeGroupProfile 时启用。产品层新增 ACP ClusterAutoscaler / MachineAutoscaler / NodeGroupProfile / autoscaler-manager，但不要绑定 OCP Machine API；`priority` expander 通过 ACP `ClusterAutoscaler.spec.priorityExpanderConfig` 表达，并由 `autoscaler-manager` 同步到 workload cluster 中固定名称的 priority ConfigMap。
+目标 MachineDeployment replicas 可以为 0
++
+MachineAutoscaler 允许 minReplicas: 0
++
+provider 已同步 ready NodeGroupProfile
++
+NodeGroupProfile 准确描述新节点调度属性
 ```
 
-## 9. 参考资料
+流程：
 
-### 项目地址
+```text
+provider controller 解析自己的机器模板 / flavor / SKU / inventory
+  -> 同步 NodeGroupProfile
+  -> 标记 Ready=True
 
-- [社区 Kubernetes Autoscaler 项目](https://github.com/kubernetes/autoscaler)
-- [社区 Cluster Autoscaler 目录（cluster-autoscaler-release-1.35）](https://github.com/kubernetes/autoscaler/tree/cluster-autoscaler-release-1.35/cluster-autoscaler)
-- [OpenShift Cluster Autoscaler Operator](https://github.com/openshift/cluster-autoscaler-operator)
-- [OpenShift Kubernetes Autoscaler fork](https://github.com/openshift/kubernetes-autoscaler)
+用户创建或更新 MachineAutoscaler(min=0,max=N,nodeGroupProfileRef=...)
+  -> autoscaler-manager 校验 NodeGroupProfile ready
+  -> 写入 min/max annotations
+  -> 写入 capacity annotations
 
-### 文档资料
+workload cluster 出现 Pending Pod
+  -> 社区 CA 读取 capacity annotations
+  -> 构造 template node
+  -> 判断该 node group 从 0 扩容后能否承载 Pending Pod
+  -> 调整 MachineDeployment.replicas 从 0 到 1 或更多
+  -> CAPI / provider controller 创建真实机器
+  -> 新 Node 加入 workload cluster
+```
 
-除特别说明外，社区 Cluster Autoscaler 相关资料固定到 `cluster-autoscaler-release-1.35` 分支；CAPI Book 和 Kubernetes 文档作为概念参考，落地时仍需以 ACP 选定的 CAPI / Kubernetes 版本为准。
+如果 `NodeGroupProfile` 缺失、未 ready 或 drift：
 
-- [OpenShift Container Platform: Applying autoscaling to a cluster](https://docs.redhat.com/en/documentation/openshift_container_platform/4.21/html/machine_management/applying-autoscaling)
-- [ClusterAutoscaler API, OCP](https://docs.redhat.com/en/documentation/openshift_container_platform/4.21/html/autoscale_apis/clusterautoscaler-autoscaling-openshift-io-v1)
-- [MachineAutoscaler API, OCP](https://docs.redhat.com/en/documentation/openshift_container_platform/4.21/html/autoscale_apis/machineautoscaler-autoscaling-openshift-io-v1beta1)
-- [Kubernetes Node Autoscaling](https://kubernetes.io/docs/concepts/cluster-administration/node-autoscaling/)
-- [Kubernetes Cluster Autoscaler FAQ（cluster-autoscaler-release-1.35）](https://github.com/kubernetes/autoscaler/blob/cluster-autoscaler-release-1.35/cluster-autoscaler/FAQ.md)
-- [Cluster Autoscaler README（cluster-autoscaler-release-1.35）](https://github.com/kubernetes/autoscaler/blob/cluster-autoscaler-release-1.35/cluster-autoscaler/README.md)
-- [Cluster Autoscaler Cluster API provider README（cluster-autoscaler-release-1.35）](https://github.com/kubernetes/autoscaler/blob/cluster-autoscaler-release-1.35/cluster-autoscaler/cloudprovider/clusterapi/README.md)
-- [Cluster API Book: Autoscaling](https://cluster-api.sigs.k8s.io/tasks/automated-machine-management/autoscaling)
-- [Cluster API Book: MachineDeployment](https://cluster-api.sigs.k8s.io/developer/core/controllers/machine-deployment)
-- [Cluster API Book: Metadata propagation](https://cluster-api.sigs.k8s.io/reference/api/metadata-propagation)
-- [Kubernetes Pod Disruptions and PDB](https://kubernetes.io/docs/concepts/workloads/pods/disruptions/)
+- `MachineAutoscaler.status.ScaleFromZeroReady=False`。
+- `autoscaler-manager` 不应宣称该 node group 支持从 0 扩容。
+- 产品层应提示用户需要 provider 支持或修复模板同步。
+
+## 11. provider 适配要求
+
+普通扩缩容要求 provider 满足：
+
+1. CAPI `MachineDeployment` 能创建和删除机器。
+2. Machine / Node `providerID` 映射稳定。
+3. 删除 CAPI `Machine` 能可靠释放底层 VM、实例或物理资源。
+4. 目标 `MachineDeployment` 上的 min/max annotations 能被社区 CA 发现。
+5. CA 能访问 workload cluster 和 global CAPI 对象。
+
+从 0 扩容额外要求 provider 满足：
+
+1. 能从 provider-specific 模板中推导新节点 CPU / memory。
+2. 能推导必要 labels、taints、zone/topology、GPU、volume limits 等调度属性。
+3. 能同步 `NodeGroupProfile` 并维护 Ready / Drift 状态。
+4. 能保证 profile 与真实新节点模板一致。
+5. 对裸金属场景，还需要确认节点库存、可分配 capacity、删除/回收语义和失败处理。
+
+ACP 初版建议只为已验证 provider 开放 autoscaling。baremetal provider 是否纳入初版，需要单独确认库存、capacity、删除语义和 providerID 映射。
+
+## 12. 可观测性与状态暴露
+
+ACP 产品层至少应暴露以下状态：
+
+| 状态类别 | 建议暴露位置 | 示例 |
+|---|---|---|
+| CA 实例部署状态 | `ClusterAutoscaler.status.conditions` | Deployment 未 ready、镜像拉取失败、RBAC 缺失。 |
+| workload cluster 访问状态 | `ClusterAutoscaler.status.conditions` | kubeconfig 无效、API server 不可达。 |
+| management cluster 访问状态 | `ClusterAutoscaler.status.conditions` | 无法访问 CAPI 对象。 |
+| priority ConfigMap 同步状态 | `ClusterAutoscaler.status.conditions` | ConfigMap 写入失败、格式错误。 |
+| node group 目标解析状态 | `MachineAutoscaler.status.conditions` | `MachineDeployment` 不存在、kind 不支持。 |
+| annotation 同步状态 | `MachineAutoscaler.status.conditions` | min/max 写入失败、权限不足、冲突。 |
+| 从 0 扩容状态 | `MachineAutoscaler.status.conditions` | profile 缺失、profile 未 ready、profile drift。 |
+| provider 模板同步状态 | `NodeGroupProfile.status.conditions` | 模板不存在、capacity 缺失、profile 已漂移。 |
+| 缩容阻塞原因 | CA metrics / events / ACP 聚合状态 | PDB 阻塞、本地存储、系统 Pod、无法重新调度。 |
+
+状态设计原则：
+
+- status 要告诉用户“为什么不能扩缩容”，而不只是 `Ready=False`。
+- 对 provider 能修复的问题，例如 profile drift，应指出来源模板和最后同步时间。
+- 对用户配置错误，例如 `minReplicas > maxReplicas`，应在 admission 或 status 中尽早反馈。
+- 对社区 CA 决策结果，应优先复用 CA events、logs、metrics，再由 ACP 聚合展示。
+
+## 13. 风险与待确认项
+
+1. 目标 Cluster Autoscaler / CAPI provider 版本是否完整支持 `MachineDeployment` autoscaling、min/max annotations、auto discovery 和删除语义。
+2. 目标版本是否支持 ACP 计划使用的 capacity annotations 或 infra template `status.capacity` / `status.nodeSystemInfo`。
+3. Machine / Node `providerID` 映射是否稳定；映射不正确会导致 CA 无法判断 Node 属于哪个 node group。
+4. 删除 CAPI `Machine` 是否可靠释放底层资源；缩容最终依赖 provider 删除语义。
+5. priority expander ConfigMap 名称固定为 `cluster-autoscaler-priority-expander`，需要由 `autoscaler-manager` 写入 workload cluster，而不是 global cluster。
+6. `minReplicas: 0` 不应作为所有 provider 的默认能力；只有 provider 能提供准确新节点调度画像时才开放。
+7. `NodeGroupProfile` 必须暴露 ready / drift 状态，避免 autoscaler 使用过期画像做调度模拟。
+8. baremetal provider 如果要纳入 autoscaling，需要单独确认节点库存、capacity、删除语义、providerID 映射以及从 0 扩容模板来源。
+9. `maxNodesTotal`、`cores-total`、`memory-total` 是 workload cluster 维度的总量边界，不是只统计 `MachineAutoscaler` 管理的节点组，也不等价于 ACP 平台 quota。
+10. Cluster Autoscaler 缩容会触发 Pod 驱逐和节点删除，ACP 需要在产品层暴露缩容阻塞原因和驱逐风险。
+
+## 14. 推荐落地路径
+
+1. 先实现社区 Cluster Autoscaler + `clusterapi` provider 的 per-workload-cluster 部署能力。
+2. 新增 ACP `ClusterAutoscaler` CRD，由 `autoscaler-manager` 管理 CA Deployment、RBAC、kubeconfig、flags 和 priority ConfigMap。
+3. 新增 ACP `MachineAutoscaler` CRD，初版只支持 CAPI `MachineDeployment`，并同步 min/max annotations。
+4. 先支持普通扩缩容，不强制要求 provider 上报 `NodeGroupProfile`。
+5. 在已验证 provider 上引入 `NodeGroupProfile`，开放 `minReplicas: 0`。
+6. 将 priority expander 产品化为 `ClusterAutoscaler.spec.expander.priorityConfig`，由 `autoscaler-manager` 同步 workload cluster 中固定名称 ConfigMap。
+7. 完善 status、events 和 metrics，让用户能看到 CA 实例部署状态、node group 同步状态、profile 状态和缩容阻塞原因。
+8. 对每个 provider 建立 autoscaling 支持矩阵，明确普通扩缩容、从 0 扩容、GPU、裸金属等能力边界。
+
+最终建议：
+
+```text
+ACP 应以社区 Cluster Autoscaler + CAPI provider 作为底层方案，先支持基于 MachineDeployment 的普通扩缩容；从 0 扩容作为 provider 可选增强能力，仅在 provider 上报 ready NodeGroupProfile 时启用。产品层新增 ClusterAutoscaler / MachineAutoscaler / NodeGroupProfile / autoscaler-manager，提供 OCP 风格体验，但不绑定 OCP Machine API。
+```
